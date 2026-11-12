@@ -1,0 +1,470 @@
+{
+  "name": "Daily Logistics - One Page (AZZAS 2154)",
+  "nodes": [
+    {
+      "id": "n01",
+      "name": "Gatilho Horário",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "notes": "Atualização de hora em hora (minuto 05).",
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1,
+              "triggerAtMinute": 5
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n02",
+      "name": "Execução Manual",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        180
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "n03",
+      "name": "Parâmetros",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        90
+      ],
+      "parameters": {
+        "jsCode": "// Parâmetros globais do relatório (ajustar metas conforme governança)\n// Data-base D-1 calculada no fuso America/Sao_Paulo.\nconst iso = new Intl.DateTimeFormat('sv-SE', { timeZone: 'America/Sao_Paulo' })\n  .format(new Date(Date.now() - 24 * 60 * 60 * 1000));   // yyyy-MM-dd\nreturn [{\n  json: {\n    grupo: 'AZZAS 2154',\n    dataBase: iso,\n    dataBaseBR: iso.split('-').reverse().join('/'),\n    slaMetaPct: 95,                      // Meta SLA (%) - % de pedidos expedidos dentro da meta de lead time\n    leadTimeMetaH: 24,                   // Meta Lead Time (h): venda -> expedição\n    rupturaMetaPct: 1,                   // Meta Ruptura (%)\n    siteFiltro: 'HUB RIO',               // escopo do relatório (hub de e-commerce)\n    // Fusão opcional de marcas do DW (chave normalizada -> chave de destino). Vazio = todas as marcas abertas.\n    // Ex.: { 'FARM ETC': 'FARM', 'FARM BEACHWEAR': 'FARM' }\n    aliasMarcas: {},\n    // Nome de exibição por chave normalizada (maiúsculas, sem acento). Demais: Title Case automático.\n    nomesMarcas: { 'BYNV': 'NV', 'MARIA FILO': 'Maria Filó', 'FABULA': 'Fábula' }\n  }\n}];"
+      }
+    },
+    {
+      "id": "n04",
+      "name": "SQL - E-commerce",
+      "type": "n8n-nodes-base.microsoftSql",
+      "typeVersion": 1.1,
+      "position": [
+        540,
+        60
+      ],
+      "alwaysOutputData": true,
+      "notes": "Query principal do e-commerce (1 linha por marca). Configurar credencial SQL Server.",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=/* =========================================================\n   SQL - E-commerce | Daily Logistics (1 linha por MARCA + 1 linha TOTAL)\n   Base: query_ecommerce (PASSO 1) - DW_LOGISTICA_PRODUCAO_ECOMMERCE\n   Pedidos = contagem ÚNICA de CHAVE_2 (filial + pedido), mesma regra do Power BI\n   (\"01 Total Pedidos\" = DISTINCTCOUNT(CHAVE_2)). Peças e valor = soma das linhas.\n   A linha TOTAL (eh_total = 1) traz pedidos únicos no grupo; um pedido com mais de\n   uma marca conta em cada marca, então total <= soma das marcas.\n   Posição de backlog = momento da execução (GETDATE): reprocessar datas passadas NÃO reproduz o backlog da época.\n   Pedidos cancelados (bases ECOMM*, LOJA_PEDIDO.CANCELADO = 1) são EXCLUÍDOS,\n   mesma regra do Power BI (tabela fcanceladosfinal / pedido_cancelado).\n   ========================================================= */\nSET NOCOUNT ON\nSET XACT_ABORT ON\n\nDECLARE @AGORA DATETIME = GETDATE()                           -- momento da atualização (horário do servidor SQL)\nDECLARE @D1 DATE = '{{ $json.dataBase }}'                    -- D-1 (data-base do relatório)\nDECLARE @D7 DATE = DATEADD(DAY, -6, @D1)                     -- backlog: últimos 7 dias (D-7 a D-1)\nDECLARE @DATAINICIO DATE = DATEADD(DAY, -30, @D1)            -- janela de leitura (pedidos antigos expedidos em D-1)\nDECLARE @DATA_CANC_INI DATE = DATEADD(DAY, -2, @DATAINICIO)    -- cancelados: pequena margem antes da janela de leitura\nDECLARE @META_LT_MIN INT = {{ $json.leadTimeMetaH }} * 60    -- meta de lead time em minutos\n\nDROP TABLE IF EXISTS #DW\nDROP TABLE IF EXISTS #CANC\n\nSELECT\n     D.CODIGO_FILIAL_ORIGEM\n    ,D.PEDIDO\n    ,CASE\n        WHEN D.SITE = 'NV - HUB ES' THEN 'HUB SP'\n        WHEN D.CODIGO_FILIAL_ORIGEM IN ('805209','550325','560030','805210','550070','190537') THEN 'HUB RIO'\n        ELSE D.SITE\n     END AS SITE\n    ,LTRIM(RTRIM(D.MARCA)) AS MARCA_ORIGINAL\n    ,D.QTDE_TOTAL\n    ,D.VALOR_TOTAL\n    ,D.DATA_HORA_INTEGRACAO AS DATA_VENDA\n    ,COALESCE(D.DATA_EMBARQUE, D.DATA_EXPEDIDO_WMS, D.EMISSAO_CTE) AS DATA_EXPEDIDO\n    ,ROW_NUMBER() OVER (PARTITION BY D.CODIGO_FILIAL_ORIGEM, D.PEDIDO, D.MARCA\n                        ORDER BY D.DATA_HORA_ATUALIZACAO DESC, D.DATA_FATURAMENTO DESC) AS RN\nINTO #DW\nFROM DB_VIEWS.dbo.DW_LOGISTICA_PRODUCAO_ECOMMERCE D\nWHERE D.DATA_HORA_INTEGRACAO >= @DATAINICIO\n  AND D.DATA_HORA_INTEGRACAO <  DATEADD(DAY, 1, @D1)\n  AND D.SITE IN ('HUB RIO','HUB SP','HUB ES','NV - HUB ES','HUB CAROL BASSI','HUB CBA')\n  AND D.STATUS_PEDIDO IN ('VALIDO','VÁLIDO')\n\nDELETE #DW WHERE RN > 1\n\n/* Cancelados: mesmas bases usadas pela tabela fcanceladosfinal do Power BI (lista sem duplicidades).\n   Chave = filial (sem espaços) + pedido, comparada com CHAVE_2 = filial + pedido. */\nSELECT\n     CONCAT(LTRIM(RTRIM(U.CODIGO_FILIAL_ORIGEM)), CAST(U.PEDIDO AS VARCHAR(50))) COLLATE DATABASE_DEFAULT AS CHAVE\nINTO #CANC\nFROM (\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMANIMALEATG].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMFYIATG].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMABRANDATG].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMFARMATG].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMFABULAATG].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMFOXTONVTEX].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMmariafiloVTEX].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMOUTLETATG].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMSPANIMALEVTEX].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMSPFARMVTEX].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMspfabulaVTEX].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMcrisbarrosVTEX].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMspnvVTEX].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMspfoxtonVTEX].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[EcommCarolBassiVTEX].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMnvVTEX].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMspmariafiloVTEX].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n) U\n\nDELETE D\nFROM #DW D\nWHERE EXISTS (SELECT 1 FROM #CANC C\n              WHERE C.CHAVE = CONCAT(D.CODIGO_FILIAL_ORIGEM, D.PEDIDO) COLLATE DATABASE_DEFAULT)\n\n-- Escopo do relatório: apenas o hub definido em Parâmetros (siteFiltro), usando o mesmo mapeamento de SITE da query_ecommerce\nDELETE #DW WHERE SITE <> '{{ $json.siteFiltro }}'\n\n\n-- ===================== RUPTURA D-1 (HUB RIO) =====================\n-- Mesma regra do Power BI \"Pendência E-commerce\": Ruptura % = peças alteradas (QTDE_ALTERADA, todos os motivos)\n-- ÷ peças em picking (status 3, itens não cancelados), ambos na data de D-1. Cancelados NÃO são excluídos aqui.\n-- Regra de HUB RIO por base (igual ao Power BI): bases ATG/VTEX do Rio; NV = HUB RIO; Cris Barros, Carol Bassi e Outlet dependem da filial.\n-- Bloco específico para siteFiltro = HUB RIO.\nIF OBJECT_ID('tempdb..#RUP')  IS NOT NULL DROP TABLE #RUP\nIF OBJECT_ID('tempdb..#PICK') IS NOT NULL DROP TABLE #PICK\nCREATE TABLE #RUP  (DB VARCHAR(20), CODIGO_FILIAL_ORIGEM VARCHAR(20), PEDIDO VARCHAR(30), CODIGO_BARRA VARCHAR(30), ITEM INT, DT_INCL DATE, QTDE_CONFERIDA INT, DT_ALT DATE, USUARIO VARCHAR(30), ID_USU_ALT VARCHAR(30), QTDE_ALTERADA INT, DESC_MOTIVO VARCHAR(200), INDICA VARCHAR(30))\nCREATE TABLE #PICK (DB VARCHAR(20), QTDE_PECAS INT)\nDECLARE @D1_FIM DATETIME = DATEADD(DAY, 1, CAST(@D1 AS DATETIME))\n\n-- NV\nINSERT INTO #RUP\nSELECT DISTINCT 'NV', A.CODIGO_FILIAL_ORIGEM, A.PEDIDO, A.CODIGO_BARRA, A.ITEM, CONVERT(DATE, A.DATA_INCLUSAO), A.QTDE_CONFERIDA,\n       CONVERT(DATE, A.DATA_HORA_ALTERACAO), D.CODIGO_USUARIO, A.ID_USUARIO_ALTERACAO, A.QTDE_ALTERADA, LTRIM(RTRIM(B.DESC_MOTIVO)),\n       CASE WHEN X.CODIGO_STATUS_PEDIDO = '9' THEN 'CANCELADO' ELSE 'PARCIALMENTE CANCELADO' END\nFROM [192.168.9.205].[ECOMMnvVTEX].[dbo].[LOJA_PEDIDO_PRODUTO] A\n    LEFT JOIN [192.168.9.205].[ECOMMnvVTEX].[dbo].[SS_WMS_LOJA_PEDIDO_MOTIVO_ALTERACAO] B ON A.ID_MOTIVO_ALTERACAO = B.ID_MOTIVO\n    LEFT JOIN (SELECT * FROM [192.168.9.205].[ECOMMnvVTEX].[dbo].SS_HISTORICO_STATUS_LOJA_PEDIDO WHERE CODIGO_STATUS_PEDIDO = '3') D ON D.PEDIDO = A.PEDIDO\n    LEFT JOIN [192.168.9.205].[ECOMMnvVTEX].[dbo].SS_HISTORICO_STATUS_LOJA_PEDIDO X ON A.PEDIDO = X.PEDIDO AND X.CODIGO_STATUS_PEDIDO = '9'\nWHERE A.QTDE_ALTERADA > 0\n    AND A.DATA_HORA_ALTERACAO >= @D1 AND A.DATA_HORA_ALTERACAO < @D1_FIM\n\nINSERT INTO #PICK\nSELECT 'NV', SUM(LP.QTDE)\nFROM [192.168.9.205].[ECOMMnvVTEX].[dbo].[SS_HISTORICO_STATUS_LOJA_PEDIDO] HIST (NOLOCK)\n    LEFT JOIN [192.168.9.205].[ECOMMnvVTEX].[dbo].[LOJA_PEDIDO_PRODUTO] LP (NOLOCK) ON HIST.PEDIDO = LP.PEDIDO AND HIST.CODIGO_FILIAL_ORIGEM = LP.CODIGO_FILIAL_ORIGEM\nWHERE HIST.DATA_HORA >= @D1 AND HIST.DATA_HORA < @D1_FIM\n    AND HIST.CODIGO_STATUS_PEDIDO = 3\n    AND LP.CANCELADO = 0\n\n-- ANIMALE\nINSERT INTO #RUP\nSELECT DISTINCT 'ANIMALE', A.CODIGO_FILIAL_ORIGEM, A.PEDIDO, A.CODIGO_BARRA, A.ITEM, CONVERT(DATE, A.DATA_INCLUSAO), A.QTDE_CONFERIDA,\n       CONVERT(DATE, A.DATA_HORA_ALTERACAO), D.CODIGO_USUARIO, A.ID_USUARIO_ALTERACAO, A.QTDE_ALTERADA, LTRIM(RTRIM(B.DESC_MOTIVO)),\n       CASE WHEN X.CODIGO_STATUS_PEDIDO = '9' THEN 'CANCELADO' ELSE 'PARCIALMENTE CANCELADO' END\nFROM [192.168.9.205].[ECOMManimaleATG].[dbo].[LOJA_PEDIDO_PRODUTO] A\n    LEFT JOIN [192.168.9.205].[ECOMManimaleATG].[dbo].[SS_WMS_LOJA_PEDIDO_MOTIVO_ALTERACAO] B ON A.ID_MOTIVO_ALTERACAO = B.ID_MOTIVO\n    LEFT JOIN (SELECT * FROM [192.168.9.205].[ECOMManimaleATG].[dbo].SS_HISTORICO_STATUS_LOJA_PEDIDO WHERE CODIGO_STATUS_PEDIDO = '3') D ON D.PEDIDO = A.PEDIDO\n    LEFT JOIN [192.168.9.205].[ECOMManimaleATG].[dbo].SS_HISTORICO_STATUS_LOJA_PEDIDO X ON A.PEDIDO = X.PEDIDO AND X.CODIGO_STATUS_PEDIDO = '9'\nWHERE A.QTDE_ALTERADA > 0\n    AND A.DATA_HORA_ALTERACAO >= @D1 AND A.DATA_HORA_ALTERACAO < @D1_FIM\n\nINSERT INTO #PICK\nSELECT 'ANIMALE', SUM(LP.QTDE)\nFROM [192.168.9.205].[ECOMManimaleATG].[dbo].[SS_HISTORICO_STATUS_LOJA_PEDIDO] HIST (NOLOCK)\n    LEFT JOIN [192.168.9.205].[ECOMManimaleATG].[dbo].[LOJA_PEDIDO_PRODUTO] LP (NOLOCK) ON HIST.PEDIDO = LP.PEDIDO AND HIST.CODIGO_FILIAL_ORIGEM = LP.CODIGO_FILIAL_ORIGEM\nWHERE HIST.DATA_HORA >= @D1 AND HIST.DATA_HORA < @D1_FIM\n    AND HIST.CODIGO_STATUS_PEDIDO = 3\n    AND LP.CANCELADO = 0\n\n-- FABULA\nINSERT INTO #RUP\nSELECT DISTINCT 'FABULA', A.CODIGO_FILIAL_ORIGEM, A.PEDIDO, A.CODIGO_BARRA, A.ITEM, CONVERT(DATE, A.DATA_INCLUSAO), A.QTDE_CONFERIDA,\n       CONVERT(DATE, A.DATA_HORA_ALTERACAO), D.CODIGO_USUARIO, A.ID_USUARIO_ALTERACAO, A.QTDE_ALTERADA, LTRIM(RTRIM(B.DESC_MOTIVO)),\n       CASE WHEN X.CODIGO_STATUS_PEDIDO = '9' THEN 'CANCELADO' ELSE 'PARCIALMENTE CANCELADO' END\nFROM [192.168.9.205].[ECOMMfabulaATG].[dbo].[LOJA_PEDIDO_PRODUTO] A\n    LEFT JOIN [192.168.9.205].[ECOMMfabulaATG].[dbo].[SS_WMS_LOJA_PEDIDO_MOTIVO_ALTERACAO] B ON A.ID_MOTIVO_ALTERACAO = B.ID_MOTIVO\n    LEFT JOIN (SELECT * FROM [192.168.9.205].[ECOMMfabulaATG].[dbo].SS_HISTORICO_STATUS_LOJA_PEDIDO WHERE CODIGO_STATUS_PEDIDO = '3') D ON D.PEDIDO = A.PEDIDO\n    LEFT JOIN [192.168.9.205].[ECOMMfabulaATG].[dbo].SS_HISTORICO_STATUS_LOJA_PEDIDO X ON A.PEDIDO = X.PEDIDO AND X.CODIGO_STATUS_PEDIDO = '9'\nWHERE A.QTDE_ALTERADA > 0\n    AND A.DATA_HORA_ALTERACAO >= @D1 AND A.DATA_HORA_ALTERACAO < @D1_FIM\n\nINSERT INTO #PICK\nSELECT 'FABULA', SUM(LP.QTDE)\nFROM [192.168.9.205].[ECOMMfabulaATG].[dbo].[SS_HISTORICO_STATUS_LOJA_PEDIDO] HIST (NOLOCK)\n    LEFT JOIN [192.168.9.205].[ECOMMfabulaATG].[dbo].[LOJA_PEDIDO_PRODUTO] LP (NOLOCK) ON HIST.PEDIDO = LP.PEDIDO AND HIST.CODIGO_FILIAL_ORIGEM = LP.CODIGO_FILIAL_ORIGEM\nWHERE HIST.DATA_HORA >= @D1 AND HIST.DATA_HORA < @D1_FIM\n    AND HIST.CODIGO_STATUS_PEDIDO = 3\n    AND LP.CANCELADO = 0\n\n-- FARM\nINSERT INTO #RUP\nSELECT DISTINCT 'FARM', A.CODIGO_FILIAL_ORIGEM, A.PEDIDO, A.CODIGO_BARRA, A.ITEM, CONVERT(DATE, A.DATA_INCLUSAO), A.QTDE_CONFERIDA,\n       CONVERT(DATE, A.DATA_HORA_ALTERACAO), D.CODIGO_USUARIO, A.ID_USUARIO_ALTERACAO, A.QTDE_ALTERADA, LTRIM(RTRIM(B.DESC_MOTIVO)),\n       CASE WHEN X.CODIGO_STATUS_PEDIDO = '9' THEN 'CANCELADO' ELSE 'PARCIALMENTE CANCELADO' END\nFROM [192.168.9.205].[ECOMMfarmATG].[dbo].[LOJA_PEDIDO_PRODUTO] A\n    LEFT JOIN [192.168.9.205].[ECOMMfarmATG].[dbo].[SS_WMS_LOJA_PEDIDO_MOTIVO_ALTERACAO] B ON A.ID_MOTIVO_ALTERACAO = B.ID_MOTIVO\n    LEFT JOIN (SELECT * FROM [192.168.9.205].[ECOMMfarmATG].[dbo].SS_HISTORICO_STATUS_LOJA_PEDIDO WHERE CODIGO_STATUS_PEDIDO = '3') D ON D.PEDIDO = A.PEDIDO\n    LEFT JOIN [192.168.9.205].[ECOMMfarmATG].[dbo].SS_HISTORICO_STATUS_LOJA_PEDIDO X ON A.PEDIDO = X.PEDIDO AND X.CODIGO_STATUS_PEDIDO = '9'\nWHERE A.QTDE_ALTERADA > 0\n    AND A.DATA_HORA_ALTERACAO >= @D1 AND A.DATA_HORA_ALTERACAO < @D1_FIM\n\nINSERT INTO #PICK\nSELECT 'FARM', SUM(LP.QTDE)\nFROM [192.168.9.205].[ECOMMfarmATG].[dbo].[SS_HISTORICO_STATUS_LOJA_PEDIDO] HIST (NOLOCK)\n    LEFT JOIN [192.168.9.205].[ECOMMfarmATG].[dbo].[LOJA_PEDIDO_PRODUTO] LP (NOLOCK) ON HIST.PEDIDO = LP.PEDIDO AND HIST.CODIGO_FILIAL_ORIGEM = LP.CODIGO_FILIAL_ORIGEM\nWHERE HIST.DATA_HORA >= @D1 AND HIST.DATA_HORA < @D1_FIM\n    AND HIST.CODIGO_STATUS_PEDIDO = 3\n    AND LP.CANCELADO = 0\n\n-- FOXTON\nINSERT INTO #RUP\nSELECT DISTINCT 'FOXTON', A.CODIGO_FILIAL_ORIGEM, A.PEDIDO, A.CODIGO_BARRA, A.ITEM, CONVERT(DATE, A.DATA_INCLUSAO), A.QTDE_CONFERIDA,\n       CONVERT(DATE, A.DATA_HORA_ALTERACAO), D.CODIGO_USUARIO, A.ID_USUARIO_ALTERACAO, A.QTDE_ALTERADA, LTRIM(RTRIM(B.DESC_MOTIVO)),\n       CASE WHEN X.CODIGO_STATUS_PEDIDO = '9' THEN 'CANCELADO' ELSE 'PARCIALMENTE CANCELADO' END\nFROM [192.168.9.205].[ECOMMfoxtonVTEX].[dbo].[LOJA_PEDIDO_PRODUTO] A\n    LEFT JOIN [192.168.9.205].[ECOMMfoxtonVTEX].[dbo].[SS_WMS_LOJA_PEDIDO_MOTIVO_ALTERACAO] B ON A.ID_MOTIVO_ALTERACAO = B.ID_MOTIVO\n    LEFT JOIN (SELECT * FROM [192.168.9.205].[ECOMMfoxtonVTEX].[dbo].SS_HISTORICO_STATUS_LOJA_PEDIDO WHERE CODIGO_STATUS_PEDIDO = '3') D ON D.PEDIDO = A.PEDIDO\n    LEFT JOIN [192.168.9.205].[ECOMMfoxtonVTEX].[dbo].SS_HISTORICO_STATUS_LOJA_PEDIDO X ON A.PEDIDO = X.PEDIDO AND X.CODIGO_STATUS_PEDIDO = '9'\nWHERE A.QTDE_ALTERADA > 0\n    AND A.DATA_HORA_ALTERACAO >= @D1 AND A.DATA_HORA_ALTERACAO < @D1_FIM\n\nINSERT INTO #PICK\nSELECT 'FOXTON', SUM(LP.QTDE)\nFROM [192.168.9.205].[ECOMMfoxtonVTEX].[dbo].[SS_HISTORICO_STATUS_LOJA_PEDIDO] HIST (NOLOCK)\n    LEFT JOIN [192.168.9.205].[ECOMMfoxtonVTEX].[dbo].[LOJA_PEDIDO_PRODUTO] LP (NOLOCK) ON HIST.PEDIDO = LP.PEDIDO AND HIST.CODIGO_FILIAL_ORIGEM = LP.CODIGO_FILIAL_ORIGEM\nWHERE HIST.DATA_HORA >= @D1 AND HIST.DATA_HORA < @D1_FIM\n    AND HIST.CODIGO_STATUS_PEDIDO = 3\n    AND LP.CANCELADO = 0\n\n-- MARIAFILO\nINSERT INTO #RUP\nSELECT DISTINCT 'MARIAFILO', A.CODIGO_FILIAL_ORIGEM, A.PEDIDO, A.CODIGO_BARRA, A.ITEM, CONVERT(DATE, A.DATA_INCLUSAO), A.QTDE_CONFERIDA,\n       CONVERT(DATE, A.DATA_HORA_ALTERACAO), D.CODIGO_USUARIO, A.ID_USUARIO_ALTERACAO, A.QTDE_ALTERADA, LTRIM(RTRIM(B.DESC_MOTIVO)),\n       CASE WHEN X.CODIGO_STATUS_PEDIDO = '9' THEN 'CANCELADO' ELSE 'PARCIALMENTE CANCELADO' END\nFROM [192.168.9.205].[ECOMMmariafiloVTEX].[dbo].[LOJA_PEDIDO_PRODUTO] A\n    LEFT JOIN [192.168.9.205].[ECOMMmariafiloVTEX].[dbo].[SS_WMS_LOJA_PEDIDO_MOTIVO_ALTERACAO] B ON A.ID_MOTIVO_ALTERACAO = B.ID_MOTIVO\n    LEFT JOIN (SELECT * FROM [192.168.9.205].[ECOMMmariafiloVTEX].[dbo].SS_HISTORICO_STATUS_LOJA_PEDIDO WHERE CODIGO_STATUS_PEDIDO = '3') D ON D.PEDIDO = A.PEDIDO\n    LEFT JOIN [192.168.9.205].[ECOMMmariafiloVTEX].[dbo].SS_HISTORICO_STATUS_LOJA_PEDIDO X ON A.PEDIDO = X.PEDIDO AND X.CODIGO_STATUS_PEDIDO = '9'\nWHERE A.QTDE_ALTERADA > 0\n    AND A.DATA_HORA_ALTERACAO >= @D1 AND A.DATA_HORA_ALTERACAO < @D1_FIM\n\nINSERT INTO #PICK\nSELECT 'MARIAFILO', SUM(LP.QTDE)\nFROM [192.168.9.205].[ECOMMmariafiloVTEX].[dbo].[SS_HISTORICO_STATUS_LOJA_PEDIDO] HIST (NOLOCK)\n    LEFT JOIN [192.168.9.205].[ECOMMmariafiloVTEX].[dbo].[LOJA_PEDIDO_PRODUTO] LP (NOLOCK) ON HIST.PEDIDO = LP.PEDIDO AND HIST.CODIGO_FILIAL_ORIGEM = LP.CODIGO_FILIAL_ORIGEM\nWHERE HIST.DATA_HORA >= @D1 AND HIST.DATA_HORA < @D1_FIM\n    AND HIST.CODIGO_STATUS_PEDIDO = 3\n    AND LP.CANCELADO = 0\n\n-- CRISBARROS\nINSERT INTO #RUP\nSELECT DISTINCT 'CRISBARROS', A.CODIGO_FILIAL_ORIGEM, A.PEDIDO, A.CODIGO_BARRA, A.ITEM, CONVERT(DATE, A.DATA_INCLUSAO), A.QTDE_CONFERIDA,\n       CONVERT(DATE, A.DATA_HORA_ALTERACAO), D.CODIGO_USUARIO, A.ID_USUARIO_ALTERACAO, A.QTDE_ALTERADA, LTRIM(RTRIM(B.DESC_MOTIVO)),\n       CASE WHEN X.CODIGO_STATUS_PEDIDO = '9' THEN 'CANCELADO' ELSE 'PARCIALMENTE CANCELADO' END\nFROM [192.168.9.205].[ECOMMcrisbarrosVTEX].[dbo].[LOJA_PEDIDO_PRODUTO] A\n    LEFT JOIN [192.168.9.205].[ECOMMcrisbarrosVTEX].[dbo].[SS_WMS_LOJA_PEDIDO_MOTIVO_ALTERACAO] B ON A.ID_MOTIVO_ALTERACAO = B.ID_MOTIVO\n    LEFT JOIN (SELECT * FROM [192.168.9.205].[ECOMMcrisbarrosVTEX].[dbo].SS_HISTORICO_STATUS_LOJA_PEDIDO WHERE CODIGO_STATUS_PEDIDO = '3') D ON D.PEDIDO = A.PEDIDO\n    LEFT JOIN [192.168.9.205].[ECOMMcrisbarrosVTEX].[dbo].SS_HISTORICO_STATUS_LOJA_PEDIDO X ON A.PEDIDO = X.PEDIDO AND X.CODIGO_STATUS_PEDIDO = '9'\n    LEFT JOIN DB_VIEWS.dbo.FILIAIS E ON E.COD_FILIAL = CASE WHEN LEN(A.CODIGO_FILIAL_ORIGEM) = 3 THEN CONCAT('000',A.CODIGO_FILIAL_ORIGEM) ELSE A.CODIGO_FILIAL_ORIGEM END COLLATE Latin1_General_CI_AS\nWHERE A.QTDE_ALTERADA > 0\n    AND A.DATA_HORA_ALTERACAO >= @D1 AND A.DATA_HORA_ALTERACAO < @D1_FIM\n    AND E.FILIAL = 'CRIS BARROS ECM RJ CM'\n\nINSERT INTO #PICK\nSELECT 'CRISBARROS', SUM(LP.QTDE)\nFROM [192.168.9.205].[ECOMMcrisbarrosVTEX].[dbo].[SS_HISTORICO_STATUS_LOJA_PEDIDO] HIST (NOLOCK)\n    LEFT JOIN [192.168.9.205].[ECOMMcrisbarrosVTEX].[dbo].[LOJA_PEDIDO_PRODUTO] LP (NOLOCK) ON HIST.PEDIDO = LP.PEDIDO AND HIST.CODIGO_FILIAL_ORIGEM = LP.CODIGO_FILIAL_ORIGEM\n    LEFT JOIN DB_VIEWS.dbo.FILIAIS E ON E.COD_FILIAL = CASE WHEN LEN(LP.CODIGO_FILIAL_ORIGEM) = 3 THEN CONCAT('000',LP.CODIGO_FILIAL_ORIGEM) ELSE LP.CODIGO_FILIAL_ORIGEM END COLLATE Latin1_General_CI_AS\nWHERE HIST.DATA_HORA >= @D1 AND HIST.DATA_HORA < @D1_FIM\n    AND HIST.CODIGO_STATUS_PEDIDO = 3\n    AND LP.CANCELADO = 0\n    AND E.FILIAL = 'CRIS BARROS ECM RJ CM'\n\n-- CAROLBASSI\nINSERT INTO #RUP\nSELECT DISTINCT 'CAROLBASSI', A.CODIGO_FILIAL_ORIGEM, A.PEDIDO, A.CODIGO_BARRA, A.ITEM, CONVERT(DATE, A.DATA_INCLUSAO), A.QTDE_CONFERIDA,\n       CONVERT(DATE, A.DATA_HORA_ALTERACAO), D.CODIGO_USUARIO, A.ID_USUARIO_ALTERACAO, A.QTDE_ALTERADA, LTRIM(RTRIM(B.DESC_MOTIVO)),\n       CASE WHEN X.CODIGO_STATUS_PEDIDO = '9' THEN 'CANCELADO' ELSE 'PARCIALMENTE CANCELADO' END\nFROM [192.168.9.205].[EcommCarolBassiVTEX].[dbo].[LOJA_PEDIDO_PRODUTO] A\n    LEFT JOIN [192.168.9.205].[EcommCarolBassiVTEX].[dbo].[SS_WMS_LOJA_PEDIDO_MOTIVO_ALTERACAO] B ON A.ID_MOTIVO_ALTERACAO = B.ID_MOTIVO\n    LEFT JOIN (SELECT * FROM [192.168.9.205].[EcommCarolBassiVTEX].[dbo].SS_HISTORICO_STATUS_LOJA_PEDIDO WHERE CODIGO_STATUS_PEDIDO = '3') D ON D.PEDIDO = A.PEDIDO\n    LEFT JOIN [192.168.9.205].[EcommCarolBassiVTEX].[dbo].SS_HISTORICO_STATUS_LOJA_PEDIDO X ON A.PEDIDO = X.PEDIDO AND X.CODIGO_STATUS_PEDIDO = '9'\n    LEFT JOIN DB_VIEWS.dbo.FILIAIS E ON E.COD_FILIAL = CASE WHEN LEN(A.CODIGO_FILIAL_ORIGEM) = 3 THEN CONCAT('000',A.CODIGO_FILIAL_ORIGEM) ELSE A.CODIGO_FILIAL_ORIGEM END COLLATE Latin1_General_CI_AS\nWHERE A.QTDE_ALTERADA > 0\n    AND A.DATA_HORA_ALTERACAO >= @D1 AND A.DATA_HORA_ALTERACAO < @D1_FIM\n    AND E.FILIAL = 'CAROL BASSI ECOMMERCE RJ'\n\nINSERT INTO #PICK\nSELECT 'CAROLBASSI', SUM(LP.QTDE)\nFROM [192.168.9.205].[EcommCarolBassiVTEX].[dbo].[SS_HISTORICO_STATUS_LOJA_PEDIDO] HIST (NOLOCK)\n    LEFT JOIN [192.168.9.205].[EcommCarolBassiVTEX].[dbo].[LOJA_PEDIDO_PRODUTO] LP (NOLOCK) ON HIST.PEDIDO = LP.PEDIDO AND HIST.CODIGO_FILIAL_ORIGEM = LP.CODIGO_FILIAL_ORIGEM\n    LEFT JOIN DB_VIEWS.dbo.FILIAIS E ON E.COD_FILIAL = CASE WHEN LEN(LP.CODIGO_FILIAL_ORIGEM) = 3 THEN CONCAT('000',LP.CODIGO_FILIAL_ORIGEM) ELSE LP.CODIGO_FILIAL_ORIGEM END COLLATE Latin1_General_CI_AS\nWHERE HIST.DATA_HORA >= @D1 AND HIST.DATA_HORA < @D1_FIM\n    AND HIST.CODIGO_STATUS_PEDIDO = 3\n    AND LP.CANCELADO = 0\n    AND E.FILIAL = 'CAROL BASSI ECOMMERCE RJ'\n\n-- OUTLET\nINSERT INTO #RUP\nSELECT DISTINCT 'OUTLET', A.CODIGO_FILIAL_ORIGEM, A.PEDIDO, A.CODIGO_BARRA, A.ITEM, CONVERT(DATE, A.DATA_INCLUSAO), A.QTDE_CONFERIDA,\n       CONVERT(DATE, A.DATA_HORA_ALTERACAO), D.CODIGO_USUARIO, A.ID_USUARIO_ALTERACAO, A.QTDE_ALTERADA, LTRIM(RTRIM(B.DESC_MOTIVO)),\n       CASE WHEN X.CODIGO_STATUS_PEDIDO = '9' THEN 'CANCELADO' ELSE 'PARCIALMENTE CANCELADO' END\nFROM [192.168.9.205].[ECOMMoutletATG].[dbo].[LOJA_PEDIDO_PRODUTO] A\n    LEFT JOIN [192.168.9.205].[ECOMMoutletATG].[dbo].[SS_WMS_LOJA_PEDIDO_MOTIVO_ALTERACAO] B ON A.ID_MOTIVO_ALTERACAO = B.ID_MOTIVO\n    LEFT JOIN (SELECT * FROM [192.168.9.205].[ECOMMoutletATG].[dbo].SS_HISTORICO_STATUS_LOJA_PEDIDO WHERE CODIGO_STATUS_PEDIDO = '3') D ON D.PEDIDO = A.PEDIDO\n    LEFT JOIN [192.168.9.205].[ECOMMoutletATG].[dbo].SS_HISTORICO_STATUS_LOJA_PEDIDO X ON A.PEDIDO = X.PEDIDO AND X.CODIGO_STATUS_PEDIDO = '9'\n    LEFT JOIN DB_VIEWS.dbo.FILIAIS E ON E.COD_FILIAL = CASE WHEN LEN(A.CODIGO_FILIAL_ORIGEM) = 3 THEN CONCAT('000',A.CODIGO_FILIAL_ORIGEM) ELSE A.CODIGO_FILIAL_ORIGEM END COLLATE Latin1_General_CI_AS\nWHERE A.QTDE_ALTERADA > 0\n    AND A.DATA_HORA_ALTERACAO >= @D1 AND A.DATA_HORA_ALTERACAO < @D1_FIM\n    AND E.FILIAL NOT LIKE 'HUB%' AND E.FILIAL NOT LIKE 'CDS%'\n\nINSERT INTO #PICK\nSELECT 'OUTLET', SUM(LP.QTDE)\nFROM [192.168.9.205].[ECOMMoutletATG].[dbo].[SS_HISTORICO_STATUS_LOJA_PEDIDO] HIST (NOLOCK)\n    LEFT JOIN [192.168.9.205].[ECOMMoutletATG].[dbo].[LOJA_PEDIDO_PRODUTO] LP (NOLOCK) ON HIST.PEDIDO = LP.PEDIDO AND HIST.CODIGO_FILIAL_ORIGEM = LP.CODIGO_FILIAL_ORIGEM\n    LEFT JOIN DB_VIEWS.dbo.FILIAIS E ON E.COD_FILIAL = CASE WHEN LEN(LP.CODIGO_FILIAL_ORIGEM) = 3 THEN CONCAT('000',LP.CODIGO_FILIAL_ORIGEM) ELSE LP.CODIGO_FILIAL_ORIGEM END COLLATE Latin1_General_CI_AS\nWHERE HIST.DATA_HORA >= @D1 AND HIST.DATA_HORA < @D1_FIM\n    AND HIST.CODIGO_STATUS_PEDIDO = 3\n    AND LP.CANCELADO = 0\n    AND E.FILIAL NOT LIKE 'HUB%' AND E.FILIAL NOT LIKE 'CDS%'\n\nSELECT\n     CASE WHEN GROUPING(X.MARCA) = 1 THEN 1 ELSE 0 END AS eh_total\n    ,X.MARCA\n    -- Ruptura D-1 (HUB RIO): valores únicos, lidos da linha TOTAL\n    ,(SELECT ISNULL(SUM(QTDE_ALTERADA),0) FROM #RUP)  AS rup_pecas\n    ,(SELECT ISNULL(SUM(QTDE_PECAS),0)    FROM #PICK) AS pick_pecas\n    -- Integrado: vendas em D-1\n    ,COUNT(DISTINCT CASE WHEN X.DT_VENDA = @D1 THEN X.CHAVE_2 END)             AS ped_integrado\n    ,SUM(CASE WHEN X.DT_VENDA = @D1 THEN ISNULL(X.QTDE_TOTAL,0)  ELSE 0 END)  AS pc_integrado\n    ,SUM(CASE WHEN X.DT_VENDA = @D1 THEN ISNULL(X.VALOR_TOTAL,0) ELSE 0 END)  AS rs_integrado\n    -- Atendido: expedidos em D-1\n    ,COUNT(DISTINCT CASE WHEN X.DT_EXPEDIDO = @D1 THEN X.CHAVE_2 END)            AS ped_atendido\n    ,SUM(CASE WHEN X.DT_EXPEDIDO = @D1 THEN ISNULL(X.QTDE_TOTAL,0)  ELSE 0 END) AS pc_atendido\n    ,SUM(CASE WHEN X.DT_EXPEDIDO = @D1 THEN ISNULL(X.VALOR_TOTAL,0) ELSE 0 END) AS rs_atendido\n    -- Backlog pendente: vendidos em D-1 que continuam sem expedição NO MOMENTO DA ATUALIZAÇÃO\n    ,COUNT(DISTINCT CASE WHEN X.DT_VENDA = @D1 AND X.ABERTO = 1 THEN X.CHAVE_2 END)             AS ped_pendente\n    ,SUM(CASE WHEN X.DT_VENDA = @D1 AND X.ABERTO = 1 THEN ISNULL(X.QTDE_TOTAL,0)  ELSE 0 END)  AS pc_pendente\n    ,SUM(CASE WHEN X.DT_VENDA = @D1 AND X.ABERTO = 1 THEN ISNULL(X.VALOR_TOTAL,0) ELSE 0 END)  AS rs_pendente\n    -- Backlog D-7: vendidos de D-7 a D-1 que continuam sem expedição NO MOMENTO DA ATUALIZAÇÃO\n    ,COUNT(DISTINCT CASE WHEN X.DT_VENDA BETWEEN @D7 AND @D1 AND X.ABERTO = 1 THEN X.CHAVE_2 END)             AS ped_backlog_7d\n    ,SUM(CASE WHEN X.DT_VENDA BETWEEN @D7 AND @D1 AND X.ABERTO = 1 THEN ISNULL(X.QTDE_TOTAL,0)  ELSE 0 END)  AS pc_backlog_7d\n    ,SUM(CASE WHEN X.DT_VENDA BETWEEN @D7 AND @D1 AND X.ABERTO = 1 THEN ISNULL(X.VALOR_TOTAL,0) ELSE 0 END)  AS rs_backlog_7d\n    -- SLA: pedidos vendidos em D-1. Cumprido = expedido em até a meta de lead time.\n    --      Base = cumpridos + descumpridos (expedidos fora da meta + pendentes já acima da meta). Pendentes ainda dentro da meta ficam fora da base.\n    ,COUNT(DISTINCT CASE WHEN X.DT_VENDA = @D1 AND X.ABERTO = 0 AND X.LT_MIN <= @META_LT_MIN THEN X.CHAVE_2 END)  AS sla_cumprido\n    ,COUNT(DISTINCT CASE WHEN X.DT_VENDA = @D1 AND (X.ABERTO = 0 OR X.LT_MIN > @META_LT_MIN) THEN X.CHAVE_2 END)   AS sla_base\n    -- Lead time (venda -> expedição) dos expedidos em D-1 (base: linhas pedido x marca)\n    ,SUM(CASE WHEN X.DT_EXPEDIDO = @D1 THEN 1 ELSE 0 END)                                                                  AS qtd_expedidos\n    ,SUM(CASE WHEN X.DT_EXPEDIDO = @D1 THEN DATEDIFF(MINUTE, X.DATA_VENDA, X.DATA_EXPEDIDO) / 60.0 ELSE 0 END)            AS soma_lead_time_h\nFROM (\n    SELECT\n         CASE\n            WHEN A.MARCA_ORIGINAL LIKE '%FOXTON%'  THEN 'FOXTON'\n            WHEN A.MARCA_ORIGINAL LIKE '%FABULA%'  THEN 'FABULA'\n            WHEN A.MARCA_ORIGINAL LIKE '%ANIMALE%' THEN 'ANIMALE'\n            ELSE A.MARCA_ORIGINAL\n         END AS MARCA\n        ,CONCAT(A.CODIGO_FILIAL_ORIGEM, A.PEDIDO) AS CHAVE_2\n        ,A.QTDE_TOTAL\n        ,A.VALOR_TOTAL\n        ,A.DATA_VENDA\n        ,A.DATA_EXPEDIDO\n        ,CAST(A.DATA_VENDA    AS DATE) AS DT_VENDA\n        ,CAST(A.DATA_EXPEDIDO AS DATE) AS DT_EXPEDIDO\n        ,CASE WHEN A.DATA_EXPEDIDO IS NULL THEN 1 ELSE 0 END AS ABERTO                                  -- sem expedição agora\n        ,DATEDIFF(MINUTE, A.DATA_VENDA, ISNULL(A.DATA_EXPEDIDO, @AGORA)) AS LT_MIN                       -- minutos da venda até a expedição (ou até agora, se pendente)\n    FROM #DW A\n) X\nGROUP BY GROUPING SETS ((X.MARCA), ())\nORDER BY GROUPING(X.MARCA), X.MARCA;\n"
+      }
+    },
+    {
+      "id": "n07",
+      "name": "PBI - Ruptura e Forecast",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        540,
+        280
+      ],
+      "disabled": true,
+      "notes": "DESATIVADO: Ruptura e Demanda x Forecast dependem de outras fontes (a definir). Stub para desenvolvimento futuro.",
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.powerbi.com/v1.0/myorg/datasets/<DATASET_ID>/executeQueries",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  queries: [{ query: \"EVALUATE ROW(\\\"ruptura_pct\\\", [% Ruptura], \\\"demanda_vs_forecast_pct\\\", [% Demanda vs Forecast])\" }],\n  serializerSettings: { includeNulls: true }\n}) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "n09",
+      "name": "Consolidar Indicadores",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        820,
+        60
+      ],
+      "parameters": {
+        "jsCode": "// Consolida o resultado do SQL E-commerce no contrato único de dados do relatório.\n// Todas as marcas retornadas pelo SQL são abertas individualmente (sem \"Demais marcas\").\n// Demanda x Forecast: fonte ainda não disponível -> permanecem nulos (o HTML exibe \"—\").\nconst safe = (name) => { try { return $(name).all().map(i => i.json); } catch (e) { return []; } };\nconst cfg = $('Parâmetros').first().json;\nconst n = (v) => Number(v) || 0;\nconst norm = (s) => String(s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase().trim();\nconst titleCase = (s) => s.toLowerCase().replace(/(^|\\s)\\S/g, (c) => c.toUpperCase());\nconst alias = cfg.aliasMarcas || {};\nconst nomes = cfg.nomesMarcas || {};\n\n// Uma linha por MARCA, com todas as métricas (ver query do nó 'SQL - E-commerce').\nconst todasLinhas = safe('SQL - E-commerce');\nconst linhaTotal = todasLinhas.find(r => Number(r.eh_total) === 1);      // TOTAL com pedidos únicos (filial + pedido)\nconst linhasSql = todasLinhas.filter(r => Number(r.eh_total) !== 1);\n\nconst zero = () => ({ ped_i: 0, pc_i: 0, rs_i: 0, ped_a: 0, pc_a: 0, rs_a: 0, ped_p: 0, pc_p: 0, rs_p: 0 });\nconst acc = {};\nlet backlog7d = { ped: 0, pc: 0, rs: 0 };\nlet lt = { soma: 0, qtd: 0 };\n\nlinhasSql.forEach(r => {\n  let k = norm(r.MARCA ?? r.marca) || 'SEM MARCA';\n  k = alias[k] ? norm(alias[k]) : k;\n  const b = (acc[k] = acc[k] || zero());\n  b.ped_i += n(r.ped_integrado); b.pc_i += n(r.pc_integrado); b.rs_i += n(r.rs_integrado);\n  b.ped_a += n(r.ped_atendido);  b.pc_a += n(r.pc_atendido);  b.rs_a += n(r.rs_atendido);\n  b.ped_p += n(r.ped_pendente);  b.pc_p += n(r.pc_pendente);  b.rs_p += n(r.rs_pendente);\n  backlog7d.ped += n(r.ped_backlog_7d); backlog7d.pc += n(r.pc_backlog_7d); backlog7d.rs += n(r.rs_backlog_7d);\n  lt.soma += n(r.soma_lead_time_h); lt.qtd += n(r.qtd_expedidos);\n});\n\n// Marcas com movimento em D-1, ordenadas por pedidos integrados (desc).\nconst marcas = Object.entries(acc)\n  .filter(([, v]) => v.ped_i + v.ped_a + v.ped_p > 0)\n  .map(([k, v]) => ({ nome: nomes[k] || titleCase(k), ...v }))\n  .sort((a, b) => b.ped_i - a.ped_i || a.nome.localeCompare(b.nome, 'pt-BR'));\n\nlet total = zero();\nif (linhaTotal) {\n  // Pedidos únicos no grupo (mesma regra do Power BI); um pedido com mais de uma marca conta em cada marca.\n  total = {\n    ped_i: n(linhaTotal.ped_integrado), pc_i: n(linhaTotal.pc_integrado), rs_i: n(linhaTotal.rs_integrado),\n    ped_a: n(linhaTotal.ped_atendido),  pc_a: n(linhaTotal.pc_atendido),  rs_a: n(linhaTotal.rs_atendido),\n    ped_p: n(linhaTotal.ped_pendente),  pc_p: n(linhaTotal.pc_pendente),  rs_p: n(linhaTotal.rs_pendente)\n  };\n  backlog7d = { ped: n(linhaTotal.ped_backlog_7d), pc: n(linhaTotal.pc_backlog_7d), rs: n(linhaTotal.rs_backlog_7d) };\n} else {\n  marcas.forEach(m => Object.keys(total).forEach(k => total[k] += m[k]));\n}\n\n// SLA: pedidos vendidos em D-1 expedidos dentro da meta ÷ (cumpridos + descumpridos). Pendentes ainda dentro do prazo ficam fora da base.\nconst slaOk = linhaTotal ? n(linhaTotal.sla_cumprido) : linhasSql.reduce((a, r) => a + n(r.sla_cumprido), 0);\nconst slaBase = linhaTotal ? n(linhaTotal.sla_base) : linhasSql.reduce((a, r) => a + n(r.sla_base), 0);\n\nconst rupPecas = linhaTotal ? n(linhaTotal.rup_pecas) : 0;\nconst rupPick = linhaTotal ? n(linhaTotal.pick_pecas) : 0;\n\nconst kpis = {\n  leadTimeH: lt.qtd > 0 ? lt.soma / lt.qtd : null,                 // média venda -> expedição (expedidos em D-1)\n  slaPct: slaBase > 0 ? (slaOk / slaBase) * 100 : null,            // SLA da safra de vendas de D-1\n  backlogAcimaSlaPed: backlog7d.ped,                               // backlog D-7: pendentes agora, vendidos de D-7 a D-1 (pedidos)\n  backlog7d,\n  rupturaPct: rupPick > 0 ? (rupPecas / rupPick) * 100 : null,     // peças alteradas ÷ peças em picking, D-1 (todos os motivos)\n  demandaVsForecastPct: null                                       // fonte pendente\n};\n\nreturn [{ json: { cfg, marcas, total, kpis, geradoEm: new Date().toISOString() } }];"
+      }
+    },
+    {
+      "id": "n10",
+      "name": "Gerar HTML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        60
+      ],
+      "parameters": {
+        "jsCode": "// Renderiza o template \"DAILY LOGISTICS | ONE PAGE\" a partir do contrato de dados.\n// O filtro de visão (Pedidos / Peças / Valor) é 100% CSS (radio + :checked), sem JavaScript,\n// para funcionar mesmo quando o n8n serve o HTML em sandbox.\nconst { cfg, marcas, total, kpis } = $input.first().json;\nconst hhmm = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' });\n\nconst esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;');\nconst isN = (v) => v === null || v === undefined || isNaN(v);\nconst num = (v) => isN(v) ? '—' : Number(v).toLocaleString('pt-BR', { maximumFractionDigits: 0 });\nconst dec = (v, c = 1) => isN(v) ? '—' : Number(v).toLocaleString('pt-BR', { minimumFractionDigits: c, maximumFractionDigits: c });\nconst mil = (v) => isN(v) ? '—' : (v >= 1000 ? dec(v / 1000, 1) + ' mil' : num(v));\nconst brl = (v) => isN(v) ? '—' : 'R$ ' + (v >= 1e6 ? dec(v / 1e6, 2) + ' mi' : num(v));\nconst sub = (p, c, r) => `${num(p)} pedidos • ${num(c)} peças • ${brl(r)}`;\nconst withUnit = (v, fmt, unit) => isN(v) ? '—' : fmt(v) + unit;\n// célula com as três visões; o CSS exibe somente a selecionada\nconst cell = (p, c, r) => `<span class=\"vp\">${num(p)}</span><span class=\"vc\">${num(c)}</span><span class=\"vr\">${brl(r)}</span>`;\nconst row = (nome, v, cls = '') => `<tr${cls}><td>${esc(nome)}</td><td class=\"n\">${cell(v.ped_i, v.pc_i, v.rs_i)}</td><td class=\"n\">${cell(v.ped_a, v.pc_a, v.rs_a)}</td><td class=\"n\">${cell(v.ped_p, v.pc_p, v.rs_p)}</td></tr>`;\n\nconst css = `\nbody{font-family:Segoe UI,Arial,sans-serif;color:#1a1a1a;margin:0;background:#fff}\n.page{max-width:720px;margin:0 auto;padding:24px;position:relative}\nh1{font-size:16px;margin:0}.meta{font-size:11px;color:#666;margin:2px 0 18px}\n.kpis{display:grid;grid-template-columns:1fr 1fr;gap:16px 40px;margin-bottom:24px}\n.kpi .l{font-size:12px;color:#555}.kpi .v{font-size:24px;font-weight:700;margin:2px 0}.kpi .s{font-size:10px;color:#666}\nh2{font-size:13px;margin:22px 0 4px;border-bottom:1px solid #ddd;padding-bottom:4px}\n.sec1head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:22px 0 4px;border-bottom:1px solid #ddd;padding-bottom:4px}\n.sec1head h2{margin:0;padding:0;border:0}\n.seg{display:flex;align-items:center;gap:6px;font-size:11px;color:#555}\n.seg .opts{display:inline-flex;border:1px solid #bbb;border-radius:4px;overflow:hidden}\n.seg label{padding:3px 10px;cursor:pointer;background:#fff;color:#333;user-select:none}\n.seg label+label{border-left:1px solid #bbb}\n.rad{position:absolute;opacity:0;width:0;height:0;pointer-events:none}\n.vc,.vr{display:none}\n#v-pd:checked ~ .sec1 label[for=v-pd],#v-pc:checked ~ .sec1 label[for=v-pc],#v-rs:checked ~ .sec1 label[for=v-rs]{background:#1a1a1a;color:#fff}\n#v-pc:checked ~ .sec1 .vp,#v-rs:checked ~ .sec1 .vp{display:none}\n#v-pc:checked ~ .sec1 .vc{display:inline}\n#v-rs:checked ~ .sec1 .vr{display:inline}\n#v-pd:focus-visible ~ .sec1 label[for=v-pd],#v-pc:focus-visible ~ .sec1 label[for=v-pc],#v-rs:focus-visible ~ .sec1 label[for=v-rs]{outline:2px solid #2563eb}\ntable{width:100%;border-collapse:collapse;font-size:11px}\nth{text-align:left;padding:6px 4px;border-bottom:2px solid #1a1a1a}\nth.n,td.n{text-align:right}\ntd{padding:7px 4px;border-bottom:1px solid #e5e5e5}\ntr.total td{font-weight:700;border-top:2px solid #1a1a1a}\n.cards{display:grid;grid-template-columns:1fr 1fr;gap:10px}\n.card{border:1px solid #ccc;border-radius:4px;padding:10px 12px}\n.note{font-size:10px;color:#777;margin-top:6px}\n.card .l{font-size:11px;color:#555}.card .v{font-size:20px;font-weight:700;margin:2px 0}.card .s{font-size:10px;color:#777}\n@media (max-width:520px){.kpis,.cards{grid-template-columns:1fr}}\n`;\n\nconst linhas = marcas.map(m => row(m.nome, m)).join('');\nconst linhaTotal = row('TOTAL GRUPO', total, ' class=\"total\"');\n\nconst html = `<!DOCTYPE html><html lang=\"pt-BR\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Daily Logistics | One Page</title><style>${css}</style></head><body><div class=\"page\">\n<input class=\"rad\" type=\"radio\" name=\"visao\" id=\"v-pd\" checked aria-label=\"Visão por pedidos\">\n<input class=\"rad\" type=\"radio\" name=\"visao\" id=\"v-pc\" aria-label=\"Visão por peças\">\n<input class=\"rad\" type=\"radio\" name=\"visao\" id=\"v-rs\" aria-label=\"Visão por valor\">\n<h1>DAILY LOGISTICS | ONE PAGE</h1>\n<div class=\"meta\">${esc(cfg.grupo)} • E-commerce ${esc(cfg.siteFiltro)} • Data-base: D-1 (${esc(cfg.dataBaseBR)}) • Atualizado às ${hhmm}</div>\n\n<div class=\"kpis\">\n  <div class=\"kpi\"><div class=\"l\">Demanda integrada</div><div class=\"v\">${mil(total.ped_i)}</div><div class=\"s\">${sub(total.ped_i, total.pc_i, total.rs_i)}</div></div>\n  <div class=\"kpi\"><div class=\"l\">Volume atendido</div><div class=\"v\">${mil(total.ped_a)}</div><div class=\"s\">${sub(total.ped_a, total.pc_a, total.rs_a)}</div></div>\n  <div class=\"kpi\"><div class=\"l\">Backlog pendente</div><div class=\"v\">${mil(total.ped_p)}</div><div class=\"s\">${sub(total.ped_p, total.pc_p, total.rs_p)}</div></div>\n  <div class=\"kpi\"><div class=\"l\">Cumprimento do SLA</div><div class=\"v\">${withUnit(kpis.slaPct, dec, '%')}</div><div class=\"s\">Meta: ${cfg.slaMetaPct}% • pedidos de D-1 expedidos em até ${cfg.leadTimeMetaH} h</div></div>\n</div>\n\n<div class=\"sec1\">\n<div class=\"sec1head\"><h2>1. DEMANDA E ATENDIMENTO POR MARCA</h2>\n  <div class=\"seg\"><span>Visão:</span><span class=\"opts\"><label for=\"v-pd\">Pedidos</label><label for=\"v-pc\">Peças</label><label for=\"v-rs\">Valor</label></span></div>\n</div>\n<table><thead><tr><th>Marca</th><th class=\"n\">Integrado</th><th class=\"n\">Atendido</th><th class=\"n\">Pendente</th></tr></thead><tbody>\n${linhas}\n${linhaTotal}\n</tbody></table>\n<div class=\"note vp\">Pedidos: contagem única (filial + pedido), exceto cancelados. O total pode ser menor que a soma das marcas, pois um pedido com mais de uma marca aparece em cada marca.</div>\n</div>\n\n<h2>2. NÍVEL DE SERVIÇO E RISCOS</h2>\n<div class=\"cards\">\n  <div class=\"card\"><div class=\"l\">Lead Time médio</div><div class=\"v\">${withUnit(kpis.leadTimeH, (x) => dec(x, 1), ' h')}</div><div class=\"s\">Meta: ${cfg.leadTimeMetaH} h</div></div>\n  <div class=\"card\"><div class=\"l\">Ruptura</div><div class=\"v\">${withUnit(kpis.rupturaPct, (x) => dec(x, 2), '%')}</div><div class=\"s\">Meta: ${dec(cfg.rupturaMetaPct, 2)}% • peças alteradas ÷ picking (D-1)</div></div>\n  <div class=\"card\"><div class=\"l\">Backlog acima do SLA</div><div class=\"v\">${withUnit(kpis.backlogAcimaSlaPed, num, ' pedidos')}</div><div class=\"s\">Pendentes agora, vendidos nos últimos 7 dias</div></div>\n  <div class=\"card\"><div class=\"l\">Demanda x Forecast</div><div class=\"v\">${isN(kpis.demandaVsForecastPct) ? '—' : (kpis.demandaVsForecastPct >= 0 ? '+' : '') + dec(kpis.demandaVsForecastPct) + '%'}</div>${isN(kpis.demandaVsForecastPct) ? '<div class=\"s\">Fonte pendente</div>' : ''}</div>\n</div>\n</div></body></html>`;\n\nreturn [{ json: { html, assunto: `Daily Logistics | ${cfg.grupo} | ${cfg.dataBaseBR}`, dataBase: cfg.dataBase } }];"
+      }
+    },
+    {
+      "id": "n15",
+      "name": "Salvar Cache",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1340,
+        60
+      ],
+      "notes": "Grava o último HTML em static data para o webhook. Só persiste com o workflow ATIVO.",
+      "parameters": {
+        "jsCode": "// Guarda o último HTML gerado (static data do workflow) para o webhook servir sem reconsultar o banco.\n// Atenção: static data só persiste em execuções de produção (workflow ativo); execuções manuais de teste não gravam.\nconst sd = $getWorkflowStaticData('global');\nconst item = $input.first().json;\nsd.html = item.html;\nsd.dataBase = item.dataBase;\nsd.geradoEm = new Date().toISOString();\nreturn $input.all();"
+      }
+    },
+    {
+      "id": "n11",
+      "name": "Enviar E-mail",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1600,
+        60
+      ],
+      "disabled": true,
+      "notes": "Desativado. O acesso é pelo webhook; ativar somente se houver envio por e-mail (layout interativo não funciona em e-mail).",
+      "parameters": {
+        "fromEmail": "<REMETENTE>",
+        "toEmail": "<DESTINATARIOS>",
+        "subject": "={{ $json.assunto }}",
+        "emailFormat": "html",
+        "html": "={{ $json.html }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "n16",
+      "name": "Webhook Relatório",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        420
+      ],
+      "webhookId": "5d0a7c34-2b1e-4c6a-9f3d-7a1e5c0b2d94",
+      "notes": "URL de produção: /webhook/daily-logistics. Sem autenticação (acesso por link): restringir por rede/VPN/proxy conforme política de segurança.",
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "daily-logistics",
+        "authentication": "none",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "n17",
+      "name": "Ler Cache",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        420
+      ],
+      "parameters": {
+        "jsCode": "// Verifica se há relatório em cache recente (<= 70 min). Se não houver, o fluxo gera na hora (consulta o SQL).\nconst sd = $getWorkflowStaticData('global');\nconst idadeMin = (sd.html && sd.geradoEm) ? Math.round((Date.now() - new Date(sd.geradoEm).getTime()) / 60000) : null;\nconst cacheOk = idadeMin !== null && idadeMin <= 70;\nreturn [{ json: { cacheOk, idadeMin, html: cacheOk ? sd.html : null } }];"
+      }
+    },
+    {
+      "id": "n19",
+      "name": "Tem Cache?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        520,
+        420
+      ],
+      "notes": "Sim: responde com o cache. Não: gera o relatório na hora (consulta o SQL) e responde.",
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c0a80019-0000-4000-8000-000000000019",
+              "leftValue": "={{ $json.cacheOk }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "n20",
+      "name": "Veio do Webhook?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1600,
+        200
+      ],
+      "notes": "Responde ao usuário somente quando a execução foi iniciada pelo webhook (não pelo gatilho horário).",
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c0a80020-0000-4000-8000-000000000020",
+              "leftValue": "={{ $('Webhook Relatório').isExecuted }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "n18",
+      "name": "Responder HTML",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1860,
+        330
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.html }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              },
+              {
+                "name": "Cache-Control",
+                "value": "no-store"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "n12",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        640
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "n13",
+      "name": "Alertar Falha",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        260,
+        640
+      ],
+      "notes": "Stub: acionar notificação ao time de dados/TI (Teams, e-mail ou ITSM).",
+      "parameters": {}
+    },
+    {
+      "id": "n14",
+      "name": "Nota - Escopo",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        520,
+        -230
+      ],
+      "parameters": {
+        "width": 860,
+        "height": 230,
+        "content": "## Daily Logistics | One Page\n**Atualização:** a cada hora (minuto 05) -> SQL -> HTML -> cache. **Acesso:** Webhook GET /webhook/daily-logistics (sem login) serve o cache (<= 70 min); sem cache válido, gera o relatório na hora.\n**Escopo:** e-commerce HUB RIO (D-1). Todas as marcas abertas; filtro de visão Pedidos/Peças/Valor em CSS puro.\n**Definições (posição no momento da atualização):** Cancelados excluídos (bases ECOMM). Integrado = vendas D-1; Atendido = expedidos D-1; Backlog pendente = vendidos D-1 ainda sem expedição agora; Backlog D-7 (card 'acima do SLA') = vendidos D-7..D-1 ainda sem expedição agora. Lead Time = venda -> expedição (expedidos D-1). SLA = pedidos vendidos em D-1 expedidos dentro da meta ÷ (cumpridos + descumpridos; pendentes já acima da meta contam como descumpridos).\n**Ruptura:** peças alteradas (todos os motivos) ÷ peças em picking, D-1, HUB RIO (regra do Power BI Pendência E-commerce).\n**Pendente de fonte:** Demanda x Forecast (exibido como '—')."
+      }
+    }
+  ],
+  "connections": {
+    "Gatilho Horário": {
+      "main": [
+        [
+          {
+            "node": "Parâmetros",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execução Manual": {
+      "main": [
+        [
+          {
+            "node": "Parâmetros",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parâmetros": {
+      "main": [
+        [
+          {
+            "node": "SQL - E-commerce",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SQL - E-commerce": {
+      "main": [
+        [
+          {
+            "node": "Consolidar Indicadores",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Consolidar Indicadores": {
+      "main": [
+        [
+          {
+            "node": "Gerar HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gerar HTML": {
+      "main": [
+        [
+          {
+            "node": "Salvar Cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Salvar Cache": {
+      "main": [
+        [
+          {
+            "node": "Enviar E-mail",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Veio do Webhook?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Veio do Webhook?": {
+      "main": [
+        [
+          {
+            "node": "Responder HTML",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Webhook Relatório": {
+      "main": [
+        [
+          {
+            "node": "Ler Cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ler Cache": {
+      "main": [
+        [
+          {
+            "node": "Tem Cache?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tem Cache?": {
+      "main": [
+        [
+          {
+            "node": "Responder HTML",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Parâmetros",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Alertar Falha",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Sao_Paulo"
+  },
+  "active": false
+}

@@ -1,0 +1,255 @@
+{
+  "name": "Daily Logistics - One Page (AZZAS 2154)",
+  "nodes": [
+    {
+      "id": "n01",
+      "name": "Gatilho Diário",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * 1-5"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n02",
+      "name": "Execução Manual",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        180
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "n03",
+      "name": "Parâmetros",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        90
+      ],
+      "parameters": {
+        "jsCode": "// Parâmetros globais do relatório (ajustar metas conforme governança)\n// Data-base D-1 calculada no fuso America/Sao_Paulo (evita virada de dia por UTC em execuções manuais).\nconst iso = new Intl.DateTimeFormat('sv-SE', { timeZone: 'America/Sao_Paulo' })\n  .format(new Date(Date.now() - 24 * 60 * 60 * 1000));   // yyyy-MM-dd\nreturn [{\n  json: {\n    grupo: 'AZZAS 2154',\n    dataBase: iso,\n    dataBaseBR: iso.split('-').reverse().join('/'),\n    slaMetaPct: 95,                      // Meta SLA (%) - % de pedidos expedidos dentro da meta de lead time\n    leadTimeMetaH: 24,                   // Meta Lead Time (h): venda -> expedição\n    rupturaMetaPct: 1,                   // Meta Ruptura (%)\n    siteFiltro: 'HUB RIO',               // escopo do relatório (hub de e-commerce)\n    marcasPrincipais: ['Farm', 'Reserva', 'NV', 'Maria Filó'],\n    // MARCA do DW (sem acento, maiúscula) -> linha do relatório. O que não estiver aqui vai para 'Demais marcas'.\n    aliasMarcas: {\n      'FARM': 'Farm', 'FARM ETC': 'Farm', 'FARM BEACHWEAR': 'Farm', 'FARM SHOES': 'Farm',\n      'RESERVA': 'Reserva',\n      'NV': 'NV', 'BYNV': 'NV',\n      'MARIA FILO': 'Maria Filó'\n    }\n  }\n}];"
+      }
+    },
+    {
+      "id": "n04",
+      "name": "SQL - E-commerce",
+      "type": "n8n-nodes-base.microsoftSql",
+      "typeVersion": 1.1,
+      "position": [
+        540,
+        60
+      ],
+      "alwaysOutputData": true,
+      "notes": "Query principal do e-commerce (1 linha por marca). Configurar credencial SQL Server.",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=/* =========================================================\n   SQL - E-commerce | Daily Logistics (1 linha por MARCA)\n   Base: query_ecommerce (PASSO 1) - DW_LOGISTICA_PRODUCAO_ECOMMERCE\n   ========================================================= */\nSET NOCOUNT ON\nSET XACT_ABORT ON\n\nDECLARE @D1 DATE = '{{ $json.dataBase }}'                    -- D-1 (data-base do relatório)\nDECLARE @D7 DATE = DATEADD(DAY, -6, @D1)                     -- backlog: últimos 7 dias (D-7 a D-1)\nDECLARE @DATAINICIO DATE = DATEADD(DAY, -30, @D1)            -- janela de leitura (pedidos antigos expedidos em D-1)\nDECLARE @META_LT_MIN INT = {{ $json.leadTimeMetaH }} * 60    -- meta de lead time em minutos\n\nDROP TABLE IF EXISTS #DW\n\nSELECT\n     D.CODIGO_FILIAL_ORIGEM\n    ,D.PEDIDO\n    ,CASE\n        WHEN D.SITE = 'NV - HUB ES' THEN 'HUB SP'\n        WHEN D.CODIGO_FILIAL_ORIGEM IN ('805209','550325','560030','805210','550070','190537') THEN 'HUB RIO'\n        ELSE D.SITE\n     END AS SITE\n    ,LTRIM(RTRIM(D.MARCA)) AS MARCA_ORIGINAL\n    ,D.QTDE_TOTAL\n    ,D.VALOR_TOTAL\n    ,D.DATA_HORA_INTEGRACAO AS DATA_VENDA\n    ,COALESCE(D.DATA_EMBARQUE, D.DATA_EXPEDIDO_WMS, D.EMISSAO_CTE) AS DATA_EXPEDIDO\n    ,ROW_NUMBER() OVER (PARTITION BY D.CODIGO_FILIAL_ORIGEM, D.PEDIDO, D.MARCA\n                        ORDER BY D.DATA_HORA_ATUALIZACAO DESC, D.DATA_FATURAMENTO DESC) AS RN\nINTO #DW\nFROM DB_VIEWS.dbo.DW_LOGISTICA_PRODUCAO_ECOMMERCE D\nWHERE D.DATA_HORA_INTEGRACAO >= @DATAINICIO\n  AND D.DATA_HORA_INTEGRACAO <  DATEADD(DAY, 1, @D1)\n  AND D.SITE IN ('HUB RIO','HUB SP','HUB ES','NV - HUB ES','HUB CAROL BASSI','HUB CBA')\n  AND D.STATUS_PEDIDO IN ('VALIDO','VÁLIDO')\n\nDELETE #DW WHERE RN > 1\n\n-- Escopo do relatório: apenas o hub definido em Parâmetros (siteFiltro), usando o mesmo mapeamento de SITE da query_ecommerce\nDELETE #DW WHERE SITE <> '{{ $json.siteFiltro }}'\n\nSELECT\n     X.MARCA\n    -- Integrado: vendas em D-1\n    ,SUM(CASE WHEN X.DT_VENDA = @D1 THEN 1 ELSE 0 END)                         AS ped_integrado\n    ,SUM(CASE WHEN X.DT_VENDA = @D1 THEN ISNULL(X.QTDE_TOTAL,0)  ELSE 0 END)  AS pc_integrado\n    ,SUM(CASE WHEN X.DT_VENDA = @D1 THEN ISNULL(X.VALOR_TOTAL,0) ELSE 0 END)  AS rs_integrado\n    -- Atendido: expedidos em D-1\n    ,SUM(CASE WHEN X.DT_EXPEDIDO = @D1 THEN 1 ELSE 0 END)                      AS ped_atendido\n    ,SUM(CASE WHEN X.DT_EXPEDIDO = @D1 THEN ISNULL(X.QTDE_TOTAL,0)  ELSE 0 END) AS pc_atendido\n    ,SUM(CASE WHEN X.DT_EXPEDIDO = @D1 THEN ISNULL(X.VALOR_TOTAL,0) ELSE 0 END) AS rs_atendido\n    -- Pendente: vendidos em D-1 e não expedidos até o fechamento de D-1\n    ,SUM(CASE WHEN X.DT_VENDA = @D1 AND X.ABERTO = 1 THEN 1 ELSE 0 END)                          AS ped_pendente\n    ,SUM(CASE WHEN X.DT_VENDA = @D1 AND X.ABERTO = 1 THEN ISNULL(X.QTDE_TOTAL,0)  ELSE 0 END)   AS pc_pendente\n    ,SUM(CASE WHEN X.DT_VENDA = @D1 AND X.ABERTO = 1 THEN ISNULL(X.VALOR_TOTAL,0) ELSE 0 END)   AS rs_pendente\n    -- Backlog dos últimos 7 dias (vendidos de D-7 a D-1, não expedidos até o fechamento de D-1)\n    ,SUM(CASE WHEN X.DT_VENDA BETWEEN @D7 AND @D1 AND X.ABERTO = 1 THEN 1 ELSE 0 END)                        AS ped_backlog_7d\n    ,SUM(CASE WHEN X.DT_VENDA BETWEEN @D7 AND @D1 AND X.ABERTO = 1 THEN ISNULL(X.QTDE_TOTAL,0)  ELSE 0 END) AS pc_backlog_7d\n    ,SUM(CASE WHEN X.DT_VENDA BETWEEN @D7 AND @D1 AND X.ABERTO = 1 THEN ISNULL(X.VALOR_TOTAL,0) ELSE 0 END) AS rs_backlog_7d\n    -- Lead time (venda -> expedição) dos pedidos expedidos em D-1\n    ,SUM(CASE WHEN X.DT_EXPEDIDO = @D1 THEN 1 ELSE 0 END)                                                                  AS qtd_expedidos\n    ,SUM(CASE WHEN X.DT_EXPEDIDO = @D1 THEN DATEDIFF(MINUTE, X.DATA_VENDA, X.DATA_EXPEDIDO) / 60.0 ELSE 0 END)            AS soma_lead_time_h\n    ,SUM(CASE WHEN X.DT_EXPEDIDO = @D1 AND DATEDIFF(MINUTE, X.DATA_VENDA, X.DATA_EXPEDIDO) <= @META_LT_MIN THEN 1 ELSE 0 END) AS qtd_dentro_meta_lt\nFROM (\n    SELECT\n         CASE\n            WHEN A.MARCA_ORIGINAL LIKE '%FOXTON%'  THEN 'FOXTON'\n            WHEN A.MARCA_ORIGINAL LIKE '%FABULA%'  THEN 'FABULA'\n            WHEN A.MARCA_ORIGINAL LIKE '%ANIMALE%' THEN 'ANIMALE'\n            ELSE A.MARCA_ORIGINAL\n         END AS MARCA\n        ,A.QTDE_TOTAL\n        ,A.VALOR_TOTAL\n        ,A.DATA_VENDA\n        ,A.DATA_EXPEDIDO\n        ,CAST(A.DATA_VENDA    AS DATE) AS DT_VENDA\n        ,CAST(A.DATA_EXPEDIDO AS DATE) AS DT_EXPEDIDO\n        ,CASE WHEN A.DATA_EXPEDIDO IS NULL OR CAST(A.DATA_EXPEDIDO AS DATE) > @D1 THEN 1 ELSE 0 END AS ABERTO\n    FROM #DW A\n) X\nGROUP BY X.MARCA\nORDER BY X.MARCA;"
+      }
+    },
+    {
+      "id": "n07",
+      "name": "PBI - Ruptura e Forecast",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        540,
+        280
+      ],
+      "disabled": true,
+      "notes": "DESATIVADO: Ruptura e Demanda x Forecast dependem de outras fontes (a definir). Stub para desenvolvimento futuro.",
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.powerbi.com/v1.0/myorg/datasets/<DATASET_ID>/executeQueries",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  queries: [{ query: \"EVALUATE ROW(\\\"ruptura_pct\\\", [% Ruptura], \\\"demanda_vs_forecast_pct\\\", [% Demanda vs Forecast])\" }],\n  serializerSettings: { includeNulls: true }\n}) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "n09",
+      "name": "Consolidar Indicadores",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        820,
+        60
+      ],
+      "parameters": {
+        "jsCode": "// Consolida o resultado do SQL E-commerce no contrato único de dados do relatório.\n// Ruptura e Demanda x Forecast: fontes ainda não disponíveis -> permanecem nulos (o HTML exibe \"—\").\nconst safe = (name) => { try { return $(name).all().map(i => i.json); } catch (e) { return []; } };\nconst cfg = $('Parâmetros').first().json;\nconst n = (v) => Number(v) || 0;\nconst norm = (s) => String(s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase().trim();\n\n// Uma linha por MARCA, com todas as métricas (ver query do nó 'SQL - E-commerce').\nconst linhasSql = safe('SQL - E-commerce');\n\nconst zero = () => ({ ped_i: 0, pc_i: 0, rs_i: 0, ped_a: 0, pc_a: 0, rs_a: 0, ped_p: 0, pc_p: 0, rs_p: 0 });\nconst marcas = {};\nconst lookup = {};                                   // marca normalizada -> nome de exibição\ncfg.marcasPrincipais.forEach(m => { marcas[m] = zero(); lookup[norm(m)] = m; });\nObject.entries(cfg.aliasMarcas || {}).forEach(([k, v]) => { lookup[norm(k)] = v; });\nmarcas['Demais marcas'] = zero();\nconst bucket = (m) => lookup[norm(m)] || 'Demais marcas';\n\nlet backlog7d = { ped: 0, pc: 0, rs: 0 };\nlet lt = { soma: 0, qtd: 0, dentro: 0 };\n\nlinhasSql.forEach(r => {\n  const b = marcas[bucket(r.MARCA ?? r.marca)];\n  b.ped_i += n(r.ped_integrado); b.pc_i += n(r.pc_integrado); b.rs_i += n(r.rs_integrado);\n  b.ped_a += n(r.ped_atendido);  b.pc_a += n(r.pc_atendido);  b.rs_a += n(r.rs_atendido);\n  b.ped_p += n(r.ped_pendente);  b.pc_p += n(r.pc_pendente);  b.rs_p += n(r.rs_pendente);\n  backlog7d.ped += n(r.ped_backlog_7d); backlog7d.pc += n(r.pc_backlog_7d); backlog7d.rs += n(r.rs_backlog_7d);\n  lt.soma += n(r.soma_lead_time_h); lt.qtd += n(r.qtd_expedidos); lt.dentro += n(r.qtd_dentro_meta_lt);\n});\n\nconst total = zero();\nObject.values(marcas).forEach(m => Object.keys(total).forEach(k => total[k] += m[k]));\n\nconst kpis = {\n  leadTimeH: lt.qtd > 0 ? lt.soma / lt.qtd : null,                 // média venda -> expedição (expedidos em D-1)\n  slaPct: lt.qtd > 0 ? (lt.dentro / lt.qtd) * 100 : null,          // % expedidos em D-1 dentro da meta de lead time\n  backlogAcimaSlaPed: backlog7d.ped,                               // backlog dos últimos 7 dias (pedidos)\n  backlog7d,\n  rupturaPct: null,                                                // fonte pendente\n  demandaVsForecastPct: null                                       // fonte pendente\n};\n\nreturn [{ json: { cfg, marcas, total, kpis, geradoEm: new Date().toISOString() } }];"
+      }
+    },
+    {
+      "id": "n10",
+      "name": "Gerar HTML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        60
+      ],
+      "parameters": {
+        "jsCode": "// Renderiza o template \"DAILY LOGISTICS | ONE PAGE\" a partir do contrato de dados.\nconst { cfg, marcas, total, kpis } = $input.first().json;\nconst hhmm = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' });\n\nconst isN = (v) => v === null || v === undefined || isNaN(v);\nconst num = (v) => isN(v) ? '—' : Number(v).toLocaleString('pt-BR', { maximumFractionDigits: 0 });\nconst dec = (v, c = 1) => isN(v) ? '—' : Number(v).toLocaleString('pt-BR', { minimumFractionDigits: c, maximumFractionDigits: c });\nconst mil = (v) => isN(v) ? '—' : (v >= 1000 ? dec(v / 1000, 1) + ' mil' : num(v));\nconst brl = (v) => isN(v) ? '—' : 'R$ ' + (v >= 1e6 ? dec(v / 1e6, 2) + ' mi' : num(v));\nconst tri = (p, c, r) => `${num(p)} ped. / ${num(c)} pç. / ${brl(r)}`;\nconst sub = (p, c, r) => `${num(p)} pedidos • ${num(c)} peças • ${brl(r)}`;\nconst withUnit = (v, fmt, unit) => isN(v) ? '—' : fmt(v) + unit;\n\nconst css = `\nbody{font-family:Segoe UI,Arial,sans-serif;color:#1a1a1a;margin:0;background:#fff}\n.page{max-width:720px;margin:0 auto;padding:24px}\nh1{font-size:16px;margin:0}.meta{font-size:11px;color:#666;margin:2px 0 18px}\n.kpis{display:grid;grid-template-columns:1fr 1fr;gap:16px 40px;margin-bottom:24px}\n.kpi .l{font-size:12px;color:#555}.kpi .v{font-size:24px;font-weight:700;margin:2px 0}.kpi .s{font-size:10px;color:#666}\nh2{font-size:13px;margin:22px 0 4px;border-bottom:1px solid #ddd;padding-bottom:4px}\ntable{width:100%;border-collapse:collapse;font-size:11px}\nth{text-align:left;padding:6px 4px;border-bottom:2px solid #1a1a1a}\ntd{padding:7px 4px;border-bottom:1px solid #e5e5e5}\ntr.total td{font-weight:700;border-top:2px solid #1a1a1a}\n.cards{display:grid;grid-template-columns:1fr 1fr;gap:10px}\n.card{border:1px solid #ccc;border-radius:4px;padding:10px 12px}\n.card .l{font-size:11px;color:#555}.card .v{font-size:20px;font-weight:700;margin:2px 0}.card .s{font-size:10px;color:#777}\n`;\n\nconst linhas = Object.entries(marcas).map(([m, v]) =>\n  `<tr><td>${m}</td><td>${tri(v.ped_i, v.pc_i, v.rs_i)}</td><td>${tri(v.ped_a, v.pc_a, v.rs_a)}</td><td>${tri(v.ped_p, v.pc_p, v.rs_p)}</td></tr>`\n).join('');\n\nconst html = `<!DOCTYPE html><html lang=\"pt-BR\"><head><meta charset=\"utf-8\"><style>${css}</style></head><body><div class=\"page\">\n<h1>DAILY LOGISTICS | ONE PAGE</h1>\n<div class=\"meta\">${cfg.grupo} • E-commerce ${cfg.siteFiltro} • Data-base: D-1 (${cfg.dataBaseBR}) • Atualizado às ${hhmm}</div>\n\n<div class=\"kpis\">\n  <div class=\"kpi\"><div class=\"l\">Demanda integrada</div><div class=\"v\">${mil(total.ped_i)}</div><div class=\"s\">${sub(total.ped_i, total.pc_i, total.rs_i)}</div></div>\n  <div class=\"kpi\"><div class=\"l\">Volume atendido</div><div class=\"v\">${mil(total.ped_a)}</div><div class=\"s\">${sub(total.ped_a, total.pc_a, total.rs_a)}</div></div>\n  <div class=\"kpi\"><div class=\"l\">Backlog pendente</div><div class=\"v\">${mil(total.ped_p)}</div><div class=\"s\">${sub(total.ped_p, total.pc_p, total.rs_p)}</div></div>\n  <div class=\"kpi\"><div class=\"l\">Cumprimento do SLA</div><div class=\"v\">${withUnit(kpis.slaPct, dec, '%')}</div><div class=\"s\">Meta: ${cfg.slaMetaPct}% • expedidos em até ${cfg.leadTimeMetaH} h</div></div>\n</div>\n\n<h2>1. DEMANDA E ATENDIMENTO POR MARCA</h2>\n<table><thead><tr><th>Marca</th><th>Integrado</th><th>Atendido</th><th>Pendente</th></tr></thead><tbody>\n${linhas}\n<tr class=\"total\"><td>TOTAL GRUPO</td><td>${tri(total.ped_i, total.pc_i, total.rs_i)}</td><td>${tri(total.ped_a, total.pc_a, total.rs_a)}</td><td>${tri(total.ped_p, total.pc_p, total.rs_p)}</td></tr>\n</tbody></table>\n\n<h2>2. NÍVEL DE SERVIÇO E RISCOS</h2>\n<div class=\"cards\">\n  <div class=\"card\"><div class=\"l\">Lead Time médio</div><div class=\"v\">${withUnit(kpis.leadTimeH, (x) => dec(x, 1), ' h')}</div><div class=\"s\">Meta: ${cfg.leadTimeMetaH} h</div></div>\n  <div class=\"card\"><div class=\"l\">Ruptura</div><div class=\"v\">${withUnit(kpis.rupturaPct, (x) => dec(x, 2), '%')}</div><div class=\"s\">Meta: ${dec(cfg.rupturaMetaPct, 2)}%${isN(kpis.rupturaPct) ? ' • fonte pendente' : ''}</div></div>\n  <div class=\"card\"><div class=\"l\">Backlog acima do SLA</div><div class=\"v\">${withUnit(kpis.backlogAcimaSlaPed, num, ' pedidos')}</div><div class=\"s\">Backlog dos últimos 7 dias</div></div>\n  <div class=\"card\"><div class=\"l\">Demanda x Forecast</div><div class=\"v\">${isN(kpis.demandaVsForecastPct) ? '—' : (kpis.demandaVsForecastPct >= 0 ? '+' : '') + dec(kpis.demandaVsForecastPct) + '%'}</div>${isN(kpis.demandaVsForecastPct) ? '<div class=\"s\">Fonte pendente</div>' : ''}</div>\n</div>\n</div></body></html>`;\n\nreturn [{ json: { html, assunto: `Daily Logistics | ${cfg.grupo} | ${cfg.dataBaseBR}`, dataBase: cfg.dataBase } }];"
+      }
+    },
+    {
+      "id": "n11",
+      "name": "Enviar E-mail",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1340,
+        60
+      ],
+      "disabled": true,
+      "notes": "Desativado até definir canal/destinatários (e-mail, Teams ou outro).",
+      "parameters": {
+        "fromEmail": "<REMETENTE>",
+        "toEmail": "<DESTINATARIOS>",
+        "subject": "={{ $json.assunto }}",
+        "emailFormat": "html",
+        "html": "={{ $json.html }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "n12",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        500
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "n13",
+      "name": "Alertar Falha",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        260,
+        500
+      ],
+      "notes": "Stub: acionar notificação ao time de dados/TI (Teams, e-mail ou ITSM).",
+      "parameters": {}
+    },
+    {
+      "id": "n14",
+      "name": "Nota - Escopo",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        520,
+        -200
+      ],
+      "parameters": {
+        "width": 760,
+        "height": 200,
+        "content": "## Daily Logistics | One Page\n**Fonte atual:** SQL e-commerce, escopo HUB RIO (D-1). Integrado = vendas D-1; Atendido = expedidos D-1; Pendente = vendidos D-1 não expedidos; Backlog acima do SLA = backlog dos últimos 7 dias.\n**Lead Time** = venda -> expedição (expedidos D-1). **SLA** = % expedidos dentro da meta de lead time.\n**Pendentes de fonte:** Ruptura e Demanda x Forecast (exibidos como '—')."
+      }
+    }
+  ],
+  "connections": {
+    "Gatilho Diário": {
+      "main": [
+        [
+          {
+            "node": "Parâmetros",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execução Manual": {
+      "main": [
+        [
+          {
+            "node": "Parâmetros",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parâmetros": {
+      "main": [
+        [
+          {
+            "node": "SQL - E-commerce",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SQL - E-commerce": {
+      "main": [
+        [
+          {
+            "node": "Consolidar Indicadores",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Consolidar Indicadores": {
+      "main": [
+        [
+          {
+            "node": "Gerar HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gerar HTML": {
+      "main": [
+        [
+          {
+            "node": "Enviar E-mail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Alertar Falha",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Sao_Paulo"
+  },
+  "active": false
+}
