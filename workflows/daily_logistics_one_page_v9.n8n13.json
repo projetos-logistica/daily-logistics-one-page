@@ -1,0 +1,563 @@
+{
+  "name": "Daily Logistics - One Page (AZZAS 2154)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "triggerAtMinute": 5
+            }
+          ]
+        }
+      },
+      "id": "0e6d9ca7-510c-4d94-a5f3-5dce6c856ea5",
+      "name": "Gatilho Horário",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        19648,
+        8576
+      ],
+      "notes": "Atualização de hora em hora (minuto 05)."
+    },
+    {
+      "parameters": {},
+      "id": "e7dfcf8d-4daa-4b74-a190-7a667b805610",
+      "name": "Execução Manual",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        19648,
+        8752
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parâmetros do relatório. Filtros vêm da URL do webhook (?ini=AAAA-MM-DD&fim=AAAA-MM-DD&filial=NOME); sem parâmetros = D-1, todas as filiais.\nconst fmtSP = (ms) => new Intl.DateTimeFormat('sv-SE', { timeZone: 'America/Sao_Paulo' }).format(new Date(ms));\nconst D1 = fmtSP(Date.now() - 24 * 60 * 60 * 1000);                 // yyyy-MM-dd\nconst MAX_DIAS = 31;                                                // limite de dias do período (protege o banco)\nconst MESES = ['jan', 'fev', 'mar', 'abr', 'mai', 'jun', 'jul', 'ago', 'set', 'out', 'nov', 'dez'];\nconst siteFiltro = 'HUB RIO';                                       // escopo do relatório (hub de e-commerce)\n\n// ---- filtros recebidos do webhook (se a execução veio do agendador/manual, usa o padrão) ----\nlet q = {};\ntry { if ($('Webhook Relatório').isExecuted) q = $('Webhook Relatório').first().json.query || {}; } catch (e) { q = {}; }\nconst okData = (s) => /^\\d{4}-\\d{2}-\\d{2}$/.test(String(s || '')) && !isNaN(new Date(s + 'T00:00:00Z').getTime());\nconst addDias = (iso, d) => new Date(new Date(iso + 'T00:00:00Z').getTime() + d * 86400000).toISOString().slice(0, 10);\nlet ini = okData(q.ini) ? q.ini : D1;\nlet fim = okData(q.fim) ? q.fim : D1;\nconst avisos = [];\nif (fim > D1) { fim = D1; avisos.push('Data final ajustada para D-1 (dados do dia corrente ainda não fechados).'); }\nif (ini > fim) { const t = ini; ini = fim; fim = t; }\nif (addDias(ini, MAX_DIAS - 1) < fim) { ini = addDias(fim, -(MAX_DIAS - 1)); avisos.push(`Período limitado a ${MAX_DIAS} dias; data inicial ajustada.`); }\n// filial: texto livre sanitizado (vai para o SQL entre aspas; só caracteres seguros)\nconst filial = String(q.filial || '').replace(/[^0-9A-Za-zÀ-ÿ \\-_.\\/&()ºª]/g, '').trim().slice(0, 80);\nconst chave = `${ini}|${fim}|${filial}`;\nconst ehPadrao = ini === D1 && fim === D1 && filial === '';\n\nconst [ano, mes] = fim.split('-').map(Number);                       // mês vigente = mês da data final\nconst [anoI, mesI, diaI] = ini.split('-').map(Number);\nconst [, , diaF] = fim.split('-').map(Number);\nconst iniMes = `${fim.slice(0, 8)}01`;\n\n// --- DAX do painel Power BI \"Pendência E-commerce\" (executeQueries: UMA consulta por requisição) ---\n// Datas explícitas (sem TODAY(): serviço em UTC). Período = [ini, fim]; mês = dia 1 do mês de \"fim\" até \"fim\".\nconst dIni = `DATE(${anoI},${mesI},${diaI})`;\nconst dFim = `DATE(${ano},${mes},${diaF})`;\nconst dMes = `DATE(${ano},${mes},1)`;\nconst dMin = ini < iniMes ? dIni : dMes;                              // filtro externo cobre período e mês\nconst fSite = `TREATAS({\"${siteFiltro}\"}, DIM_SITE[SITE])`;\nconst rup = `SUM('Base Ruptura'[QTDE_ALTERADA])`;\nconst pick = `SUM('Base Picking'[QTDE_PECAS])`;\nconst cPer = `DIM_CALENDARIO[Date] >= ${dIni}, DIM_CALENDARIO[Date] <= ${dFim}`;\nconst pbiQueries = [\n  `EVALUATE SUMMARIZECOLUMNS(ROLLUPADDISSUBTOTAL(DIM_MARCA[MARCA], \"eh_total\"), ${fSite}, FILTER(ALL(DIM_CALENDARIO[Date]), DIM_CALENDARIO[Date] >= ${dMin} && DIM_CALENDARIO[Date] <= ${dFim}), \"rup_mes\", CALCULATE(${rup}, DIM_CALENDARIO[Date] >= ${dMes}, DIM_CALENDARIO[Date] <= ${dFim}), \"pick_mes\", CALCULATE(${pick}, DIM_CALENDARIO[Date] >= ${dMes}, DIM_CALENDARIO[Date] <= ${dFim}), \"rup_dia\", CALCULATE(${rup}, ${cPer}), \"pick_dia\", CALCULATE(${pick}, ${cPer}))`\n];\nconst br = (s) => s.split('-').reverse().join('/');\n\nreturn [{\n  json: {\n    grupo: 'AZZAS 2154',\n    dataBase: fim,                                   // mantido: fim do período (compatibilidade)\n    dataIni: ini, dataFim: fim, d1: D1, maxDias: MAX_DIAS,\n    dataIniBR: br(ini), dataFimBR: br(fim), dataBaseBR: br(fim),\n    periodoD1: ini === D1 && fim === D1,\n    filial, filialSql: filial.replace(/'/g, \"''\"),\n    chave, ehPadrao, avisos,\n    mesLabel: `${MESES[mes - 1]}/${ano}`,\n    slaMetaPct: 95, leadTimeMetaH: 24, rupturaMetaPct: 1,\n    siteFiltro, pbiQueries,\n    aliasMarcas: {},\n    nomesMarcas: { 'BYNV': 'NV', 'MARIA FILO': 'Maria Filó', 'FABULA': 'Fábula' }\n  }\n}];\n"
+      },
+      "id": "1aa339e7-4846-470b-96c7-0d7afe0c9bac",
+      "name": "Parâmetros",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        19904,
+        8656
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=/* =========================================================\n   SQL - E-commerce | Daily Logistics (1 linha por MARCA + 1 linha TOTAL)\n   Período [@INI, @D1] e filial opcionais (parâmetros do webhook). Base: query_ecommerce (PASSO 1) - DW_LOGISTICA_PRODUCAO_ECOMMERCE\n   Pedidos = contagem ÚNICA de CHAVE_2 (filial + pedido), mesma regra do Power BI\n   (\"01 Total Pedidos\" = DISTINCTCOUNT(CHAVE_2)). Peças e valor = soma das linhas.\n   A linha TOTAL (eh_total = 1) traz pedidos únicos no grupo; um pedido com mais de\n   uma marca conta em cada marca, então total <= soma das marcas.\n   Posição de backlog = momento da execução (GETDATE): reprocessar datas passadas NÃO reproduz o backlog da época.\n   Pedidos cancelados (bases ECOMM*, LOJA_PEDIDO.CANCELADO = 1) são EXCLUÍDOS,\n   mesma regra do Power BI (tabela fcanceladosfinal / pedido_cancelado).\n   ========================================================= */\nSET NOCOUNT ON\nSET XACT_ABORT ON\n\nDECLARE @AGORA DATETIME = GETDATE()                           -- momento da atualização (horário do servidor SQL)\nDECLARE @INI DATE = '{{ $json.dataIni }}'                    -- início do período (padrão: D-1)\nDECLARE @D1 DATE = '{{ $json.dataFim }}'                     -- fim do período (padrão: D-1); nome mantido nas fórmulas\nDECLARE @FILIAL NVARCHAR(200) = N'{{ $json.filialSql }}'     -- filial selecionada ('' = todas)\nDECLARE @D7 DATE = DATEADD(DAY, -6, @D1)                     -- backlog: 7 dias até a data final\nDECLARE @INI_MES DATE = DATEFROMPARTS(YEAR(@D1), MONTH(@D1), 1)  -- 1º dia do mês da data final (lead time mensal)\nDECLARE @DATAINICIO DATE = (SELECT MIN(V) FROM (VALUES (DATEADD(DAY, -30, @INI)), (DATEADD(DAY, -7, @INI_MES)), (@D7)) T(V))  -- janela de leitura: cobre pedidos de até 30 dias antes do período expedidos nele, o mês e o backlog D-7\nDECLARE @DATA_CANC_INI DATE = DATEADD(DAY, -2, @DATAINICIO)    -- cancelados: pequena margem antes da janela de leitura\nDECLARE @META_LT_MIN INT = {{ $json.leadTimeMetaH }} * 60    -- meta de lead time em minutos\n\nDROP TABLE IF EXISTS #DW\nDROP TABLE IF EXISTS #CANC\nDROP TABLE IF EXISTS #FIL\nDROP TABLE IF EXISTS #RES\n\nSELECT\n     D.CODIGO_FILIAL_ORIGEM\n    ,D.PEDIDO\n    ,CASE\n        WHEN D.SITE = 'NV - HUB ES' THEN 'HUB SP'\n        WHEN D.CODIGO_FILIAL_ORIGEM IN ('805209','550325','560030','805210','550070','190537') THEN 'HUB RIO'\n        ELSE D.SITE\n     END AS SITE\n    ,LTRIM(RTRIM(D.MARCA)) AS MARCA_ORIGINAL\n    ,LTRIM(RTRIM(D.FILIAL)) AS FILIAL                 -- nome da filial no DW (ajuste a coluna aqui se o nome for outro)\n    ,D.QTDE_TOTAL\n    ,D.VALOR_TOTAL\n    ,D.DATA_HORA_INTEGRACAO AS DATA_VENDA\n    ,COALESCE(D.DATA_EMBARQUE, D.DATA_EXPEDIDO_WMS, D.EMISSAO_CTE) AS DATA_EXPEDIDO\n    ,ROW_NUMBER() OVER (PARTITION BY D.CODIGO_FILIAL_ORIGEM, D.PEDIDO, D.MARCA\n                        ORDER BY D.DATA_HORA_ATUALIZACAO DESC, D.DATA_FATURAMENTO DESC) AS RN\nINTO #DW\nFROM DB_VIEWS.dbo.DW_LOGISTICA_PRODUCAO_ECOMMERCE D\nWHERE D.DATA_HORA_INTEGRACAO >= @DATAINICIO\n  AND D.DATA_HORA_INTEGRACAO <  DATEADD(DAY, 1, @D1)\n  AND D.SITE IN ('HUB RIO','HUB SP','HUB ES','NV - HUB ES','HUB CAROL BASSI','HUB CBA')\n  AND D.STATUS_PEDIDO IN ('VALIDO','VÁLIDO')\n\nDELETE #DW WHERE RN > 1\n\n/* Cancelados: mesmas bases usadas pela tabela fcanceladosfinal do Power BI (lista sem duplicidades).\n   Chave = filial (sem espaços) + pedido, comparada com CHAVE_2 = filial + pedido. */\nSELECT\n     CONCAT(LTRIM(RTRIM(U.CODIGO_FILIAL_ORIGEM)), CAST(U.PEDIDO AS VARCHAR(50))) COLLATE DATABASE_DEFAULT AS CHAVE\nINTO #CANC\nFROM (\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMANIMALEATG].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMFYIATG].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMABRANDATG].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMFARMATG].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMFABULAATG].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMFOXTONVTEX].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMmariafiloVTEX].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMOUTLETATG].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMSPANIMALEVTEX].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMSPFARMVTEX].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMspfabulaVTEX].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMcrisbarrosVTEX].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMspnvVTEX].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMspfoxtonVTEX].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[EcommCarolBassiVTEX].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMnvVTEX].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n    UNION ALL\n    SELECT CODIGO_FILIAL_ORIGEM, PEDIDO FROM [192.168.9.205].[ECOMMspmariafiloVTEX].[DBO].[LOJA_PEDIDO] WHERE CANCELADO = 1 AND DATA >= @DATA_CANC_INI\n) U\n\nDELETE D\nFROM #DW D\nWHERE EXISTS (SELECT 1 FROM #CANC C\n              WHERE C.CHAVE = CONCAT(D.CODIGO_FILIAL_ORIGEM, D.PEDIDO) COLLATE DATABASE_DEFAULT)\n\n-- Escopo do relatório: apenas o hub definido em Parâmetros (siteFiltro), usando o mesmo mapeamento de SITE da query_ecommerce\nDELETE #DW WHERE SITE <> '{{ $json.siteFiltro }}'\n\n-- Lista de filiais do hub na janela (alimenta a lista suspensa; antes de aplicar o filtro de filial)\nSELECT DISTINCT FILIAL INTO #FIL FROM #DW WHERE FILIAL IS NOT NULL AND FILIAL <> ''\n\n-- Filtro de filial (vazio = todas)\nIF @FILIAL <> N'' DELETE #DW WHERE ISNULL(FILIAL, '') COLLATE DATABASE_DEFAULT <> @FILIAL COLLATE DATABASE_DEFAULT\n\n\nSELECT\n     CASE WHEN GROUPING(X.MARCA) = 1 THEN 1 ELSE 0 END AS eh_total\n    ,CAST(X.MARCA AS NVARCHAR(200)) AS MARCA\n    -- Integrado: vendas no período\n    ,COUNT(DISTINCT CASE WHEN X.DT_VENDA BETWEEN @INI AND @D1 THEN X.CHAVE_2 END)             AS ped_integrado\n    ,SUM(CASE WHEN X.DT_VENDA BETWEEN @INI AND @D1 THEN ISNULL(X.QTDE_TOTAL,0)  ELSE 0 END)  AS pc_integrado\n    ,SUM(CASE WHEN X.DT_VENDA BETWEEN @INI AND @D1 THEN ISNULL(X.VALOR_TOTAL,0) ELSE 0 END)  AS rs_integrado\n    -- Atendido: expedidos no período\n    ,COUNT(DISTINCT CASE WHEN X.DT_EXPEDIDO BETWEEN @INI AND @D1 THEN X.CHAVE_2 END)            AS ped_atendido\n    ,SUM(CASE WHEN X.DT_EXPEDIDO BETWEEN @INI AND @D1 THEN ISNULL(X.QTDE_TOTAL,0)  ELSE 0 END) AS pc_atendido\n    ,SUM(CASE WHEN X.DT_EXPEDIDO BETWEEN @INI AND @D1 THEN ISNULL(X.VALOR_TOTAL,0) ELSE 0 END) AS rs_atendido\n    -- Backlog pendente: vendidos em D-1 que continuam sem expedição NO MOMENTO DA ATUALIZAÇÃO\n    ,COUNT(DISTINCT CASE WHEN X.DT_VENDA BETWEEN @INI AND @D1 AND X.ABERTO = 1 THEN X.CHAVE_2 END)             AS ped_pendente\n    ,SUM(CASE WHEN X.DT_VENDA BETWEEN @INI AND @D1 AND X.ABERTO = 1 THEN ISNULL(X.QTDE_TOTAL,0)  ELSE 0 END)  AS pc_pendente\n    ,SUM(CASE WHEN X.DT_VENDA BETWEEN @INI AND @D1 AND X.ABERTO = 1 THEN ISNULL(X.VALOR_TOTAL,0) ELSE 0 END)  AS rs_pendente\n    -- Backlog D-7: vendidos de D-7 a D-1 que continuam sem expedição NO MOMENTO DA ATUALIZAÇÃO\n    ,COUNT(DISTINCT CASE WHEN X.DT_VENDA BETWEEN @D7 AND @D1 AND X.ABERTO = 1 THEN X.CHAVE_2 END)             AS ped_backlog_7d\n    ,SUM(CASE WHEN X.DT_VENDA BETWEEN @D7 AND @D1 AND X.ABERTO = 1 THEN ISNULL(X.QTDE_TOTAL,0)  ELSE 0 END)  AS pc_backlog_7d\n    ,SUM(CASE WHEN X.DT_VENDA BETWEEN @D7 AND @D1 AND X.ABERTO = 1 THEN ISNULL(X.VALOR_TOTAL,0) ELSE 0 END)  AS rs_backlog_7d\n    -- SLA: pedidos vendidos em D-1. Cumprido = expedido em até a meta de lead time.\n    --      Base = cumpridos + descumpridos (expedidos fora da meta + pendentes já acima da meta). Pendentes ainda dentro da meta ficam fora da base.\n    ,COUNT(DISTINCT CASE WHEN X.DT_VENDA BETWEEN @INI AND @D1 AND X.ABERTO = 0 AND X.LT_MIN <= @META_LT_MIN THEN X.CHAVE_2 END)  AS sla_cumprido\n    ,COUNT(DISTINCT CASE WHEN X.DT_VENDA BETWEEN @INI AND @D1 AND (X.ABERTO = 0 OR X.LT_MIN > @META_LT_MIN) THEN X.CHAVE_2 END)   AS sla_base\n    -- Lead time (venda -> expedição) dos expedidos em D-1 (base: linhas pedido x marca)\n    ,SUM(CASE WHEN X.DT_EXPEDIDO BETWEEN @INI AND @D1 THEN 1 ELSE 0 END)                                                                  AS qtd_expedidos\n    ,SUM(CASE WHEN X.DT_EXPEDIDO BETWEEN @INI AND @D1 THEN DATEDIFF(MINUTE, X.DATA_VENDA, X.DATA_EXPEDIDO) / 60.0 ELSE 0 END)            AS soma_lead_time_h\n    -- Lead time do mês vigente: expedidos de 1º do mês até D-1 (mesma base)\n    ,SUM(CASE WHEN X.DT_EXPEDIDO BETWEEN @INI_MES AND @D1 THEN 1 ELSE 0 END)                                              AS qtd_expedidos_mes\n    ,SUM(CASE WHEN X.DT_EXPEDIDO BETWEEN @INI_MES AND @D1 THEN DATEDIFF(MINUTE, X.DATA_VENDA, X.DATA_EXPEDIDO) / 60.0 ELSE 0 END) AS soma_lead_time_h_mes\nINTO #RES\nFROM (\n    SELECT\n         CASE\n            WHEN A.MARCA_ORIGINAL LIKE '%FOXTON%'  THEN 'FOXTON'\n            WHEN A.MARCA_ORIGINAL LIKE '%FABULA%'  THEN 'FABULA'\n            WHEN A.MARCA_ORIGINAL LIKE '%ANIMALE%' THEN 'ANIMALE'\n            ELSE A.MARCA_ORIGINAL\n         END AS MARCA\n        ,CONCAT(A.CODIGO_FILIAL_ORIGEM, A.PEDIDO) AS CHAVE_2\n        ,A.QTDE_TOTAL\n        ,A.VALOR_TOTAL\n        ,A.DATA_VENDA\n        ,A.DATA_EXPEDIDO\n        ,CAST(A.DATA_VENDA    AS DATE) AS DT_VENDA\n        ,CAST(A.DATA_EXPEDIDO AS DATE) AS DT_EXPEDIDO\n        ,CASE WHEN A.DATA_EXPEDIDO IS NULL THEN 1 ELSE 0 END AS ABERTO                                  -- sem expedição agora\n        ,DATEDIFF(MINUTE, A.DATA_VENDA, ISNULL(A.DATA_EXPEDIDO, @AGORA)) AS LT_MIN                       -- minutos da venda até a expedição (ou até agora, se pendente)\n    FROM #DW A\n) X\nGROUP BY GROUPING SETS ((X.MARCA), ())\n\n-- Linhas eh_total = 2: lista de filiais (apenas a coluna MARCA preenchida, com o nome da filial)\nINSERT INTO #RES (eh_total, MARCA) SELECT 2, FILIAL FROM #FIL\n\nSELECT * FROM #RES ORDER BY eh_total, MARCA;\n"
+      },
+      "id": "ad514dcd-b520-4750-9741-4f58098805e3",
+      "name": "SQL - E-commerce",
+      "type": "n8n-nodes-base.microsoftSql",
+      "typeVersion": 1.1,
+      "position": [
+        20192,
+        8640
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "microsoftSql": {
+          "id": "JxEAFpnayhrOYRpo",
+          "name": "sql_serve_somalog"
+        }
+      },
+      "notes": "Query principal do e-commerce (1 linha por marca). Configurar credencial SQL Server."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.powerbi.com/v1.0/myorg/groups/5a8444b5-b2ad-48e3-ae01-74c647694076/datasets/f6e6ddad-165b-448f-9d3f-d0147e84efa2/executeQueries",
+        "authentication": "none",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $('pegar_token').first().json.access_token }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ queries: $('Parâmetros').first().json.pbiQueries.map(q => ({ query: q })), serializerSettings: { includeNulls: true } }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "0e6394b2-fc9a-4574-84f5-3414c8b19ab8",
+      "name": "Ruptura_Ecommerce",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        20464,
+        8848
+      ],
+      "executeOnce": true,
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput",
+      "notes": "Power BI (executeQueries): ruptura D-1 e mensal, total e por marca. Autenticação: Bearer do nó pegar_token. Executa 1x. Se falhar, o relatório sai com Ruptura '—'."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Consolida SQL E-commerce + Power BI (ruptura) no contrato único de dados do relatório.\n// Todas as marcas retornadas pelo SQL são abertas individualmente (sem \"Demais marcas\").\n// Ruptura vem do Power BI; se o Power BI falhar ou ainda não tiver o dia, o indicador fica nulo (o HTML exibe \"—\").\nconst safe = (name) => { try { return $(name).all().map(i => i.json); } catch (e) { return []; } };\nconst cfg = $('Parâmetros').first().json;\nconst n = (v) => Number(v) || 0;\nconst norm = (s) => String(s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase().trim();\nconst titleCase = (s) => s.toLowerCase().replace(/(^|\\s)\\S/g, (c) => c.toUpperCase());\nconst alias = cfg.aliasMarcas || {};\nconst nomes = cfg.nomesMarcas || {};\nconst pct = (a, b) => (b > 0 ? (a / b) * 100 : null);\n\n// ---------- SQL: uma linha por MARCA + linha TOTAL (pedidos únicos) ----------\nconst todasLinhas = safe('SQL - E-commerce');\nconst linhaTotal = todasLinhas.find(r => Number(r.eh_total) === 1);\nconst linhasSql = todasLinhas.filter(r => Number(r.eh_total) === 0);\n// eh_total = 2: lista de filiais do hub (alimenta a lista suspensa)\nconst filiais = [...new Set(todasLinhas.filter(r => Number(r.eh_total) === 2).map(r => String(r.MARCA ?? r.marca ?? '').trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'pt-BR'));\nif (cfg.filial && !filiais.includes(cfg.filial)) filiais.push(cfg.filial);\n\nconst zero = () => ({ ped_i: 0, pc_i: 0, rs_i: 0, ped_a: 0, pc_a: 0, rs_a: 0, ped_p: 0, pc_p: 0, rs_p: 0,\n  b7_ped: 0, b7_pc: 0, b7_rs: 0, sla_ok: 0, sla_base: 0, lt_soma: 0, lt_qtd: 0, ltm_soma: 0, ltm_qtd: 0 });\nconst acc = {};\n\nlinhasSql.forEach(r => {\n  let k = norm(r.MARCA ?? r.marca) || 'SEM MARCA';\n  k = alias[k] ? norm(alias[k]) : k;\n  const b = (acc[k] = acc[k] || zero());\n  b.ped_i += n(r.ped_integrado); b.pc_i += n(r.pc_integrado); b.rs_i += n(r.rs_integrado);\n  b.ped_a += n(r.ped_atendido);  b.pc_a += n(r.pc_atendido);  b.rs_a += n(r.rs_atendido);\n  b.ped_p += n(r.ped_pendente);  b.pc_p += n(r.pc_pendente);  b.rs_p += n(r.rs_pendente);\n  b.b7_ped += n(r.ped_backlog_7d); b.b7_pc += n(r.pc_backlog_7d); b.b7_rs += n(r.rs_backlog_7d);\n  b.sla_ok += n(r.sla_cumprido); b.sla_base += n(r.sla_base);\n  b.lt_soma += n(r.soma_lead_time_h);     b.lt_qtd += n(r.qtd_expedidos);\n  b.ltm_soma += n(r.soma_lead_time_h_mes); b.ltm_qtd += n(r.qtd_expedidos_mes);\n});\n\n// ---------- Power BI: ruptura (1 consulta: linhas por marca + linha eh_total) ----------\nlet rp = null;\ntry { rp = $('Ruptura_Ecommerce').first().json; } catch (e) { rp = null; }\nconst pbiRows = ((rp && rp.results && rp.results[0] && rp.results[0].tables && rp.results[0].tables[0] && rp.results[0].tables[0].rows) || [])\n  .map(r => { const o = {}; Object.keys(r).forEach(k => { o[k.replace(/^.*\\[|\\]$/g, '')] = r[k]; }); return o; });\n// A ruptura do Power BI não é aberta por filial: com filial selecionada o indicador fica indisponível (\"—\").\nconst rupPorFilial = !!cfg.filial;\nconst linhaPbiTotal = rupPorFilial ? null : pbiRows.find(r => r.eh_total === true);\nconst rupDia = linhaPbiTotal ? { r: n(linhaPbiTotal.rup_dia), p: n(linhaPbiTotal.pick_dia) } : { r: 0, p: 0 };\nconst rupMes = linhaPbiTotal ? { r: n(linhaPbiTotal.rup_mes), p: n(linhaPbiTotal.pick_mes) } : { r: 0, p: 0 };\n\n// Marcas do Power BI -> mesma chave do SQL (Animale Jeans entra em Animale; NV = BYNV). Marca em branco só entra no total.\nconst keyPbi = (s) => {\n  let k = norm(s);\n  if (!k) return null;\n  if (k.includes('FOXTON')) k = 'FOXTON'; else if (k.includes('FABULA')) k = 'FABULA'; else if (k.includes('ANIMALE')) k = 'ANIMALE';\n  if (k === 'NV' && !acc['NV'] && acc['BYNV']) k = 'BYNV';\n  return alias[k] ? norm(alias[k]) : k;\n};\nconst rupMarca = {};\n(rupPorFilial ? [] : pbiRows).filter(r => r.eh_total !== true).forEach(r => {\n  const k = keyPbi(r.MARCA); if (!k) return;\n  const o = (rupMarca[k] = rupMarca[k] || { dia: { r: 0, p: 0 }, mes: { r: 0, p: 0 } });\n  o.dia.r += n(r.rup_dia); o.dia.p += n(r.pick_dia);\n  o.mes.r += n(r.rup_mes); o.mes.p += n(r.pick_mes);\n});\n\n// ---------- Tabela por marca (não é afetada pelo filtro de marca) ----------\nconst marcas = Object.entries(acc)\n  .filter(([, v]) => v.ped_i + v.ped_a + v.ped_p > 0)\n  .map(([k, v]) => ({ chave: k, nome: nomes[k] || titleCase(k), ...v }))\n  .sort((a, b) => b.ped_i - a.ped_i || a.nome.localeCompare(b.nome, 'pt-BR'));\n\nlet total = zero();\nif (linhaTotal) {\n  // Pedidos únicos no grupo (mesma regra do Power BI); um pedido com mais de uma marca conta em cada marca.\n  total = { ...total,\n    ped_i: n(linhaTotal.ped_integrado), pc_i: n(linhaTotal.pc_integrado), rs_i: n(linhaTotal.rs_integrado),\n    ped_a: n(linhaTotal.ped_atendido),  pc_a: n(linhaTotal.pc_atendido),  rs_a: n(linhaTotal.rs_atendido),\n    ped_p: n(linhaTotal.ped_pendente),  pc_p: n(linhaTotal.pc_pendente),  rs_p: n(linhaTotal.rs_pendente),\n    b7_ped: n(linhaTotal.ped_backlog_7d), b7_pc: n(linhaTotal.pc_backlog_7d), b7_rs: n(linhaTotal.rs_backlog_7d),\n    sla_ok: n(linhaTotal.sla_cumprido), sla_base: n(linhaTotal.sla_base) };\n} else {\n  marcas.forEach(m => ['ped_i','pc_i','rs_i','ped_a','pc_a','rs_a','ped_p','pc_p','rs_p','b7_ped','b7_pc','b7_rs','sla_ok','sla_base'].forEach(k => total[k] += m[k]));\n}\nObject.values(acc).forEach(v => { total.lt_soma += v.lt_soma; total.lt_qtd += v.lt_qtd; total.ltm_soma += v.ltm_soma; total.ltm_qtd += v.ltm_qtd; });\n\n// ---------- Indicadores (filtráveis por marca) ----------\n// SLA: pedidos vendidos em D-1 expedidos dentro da meta ÷ (cumpridos + descumpridos). Pendentes ainda dentro do prazo ficam fora da base.\nconst indicadores = (v, rd, rm) => ({\n  ped_i: v.ped_i, pc_i: v.pc_i, rs_i: v.rs_i, ped_a: v.ped_a, pc_a: v.pc_a, rs_a: v.rs_a, ped_p: v.ped_p, pc_p: v.pc_p, rs_p: v.rs_p,\n  slaPct: pct(v.sla_ok, v.sla_base),\n  leadTimeH: v.lt_qtd > 0 ? v.lt_soma / v.lt_qtd : null,           // média venda -> expedição (expedidos no período)\n  leadTimeMesH: v.ltm_qtd > 0 ? v.ltm_soma / v.ltm_qtd : null,     // idem, expedidos de 1º do mês até a data final\n  backlogAcimaSlaPed: v.b7_ped,                                    // backlog D-7: pendentes agora, vendidos de D-7 a D-1\n  rupturaDiaPct: rd && rd.p > 0 ? pct(rd.r, rd.p) : null,          // peças alteradas ÷ picking, D-1\n  rupturaMesPct: rm && rm.p > 0 ? pct(rm.r, rm.p) : null           // idem, mês vigente até D-1\n});\n\n// Filtro de marca com seleção múltipla (CSS puro, sem JavaScript): todas as combinações são calculadas aqui.\n// Até MAX_SEL marcas selecionáveis (as de maior volume); sem seleção (ou todas selecionadas) = total do hub.\n// Ao combinar marcas, os valores são a soma das marcas (um pedido com mais de uma marca conta em cada uma).\nconst MAX_SEL = 9;\nconst selecionaveis = marcas.slice(0, MAX_SEL);\nconst campos = Object.keys(zero());\nconst somar = (lista) => lista.reduce((s, m) => { campos.forEach(k => { s[k] += m[k] || 0; }); return s; }, zero());\nconst somaRup = (lista, per) => lista.reduce((s, m) => { const x = (rupMarca[m.chave] || {})[per] || { r: 0, p: 0 }; s.r += x.r; s.p += x.p; return s; }, { r: 0, p: 0 });\nconst todas = indicadores(total, rupDia, rupMes);\nconst nSel = selecionaveis.length;\nconst combos = [];\nfor (let mask = 1; mask < (1 << nSel) - 1; mask++) {\n  const lista = selecionaveis.filter((_, i) => mask & (1 << i));\n  combos.push({ mask, ind: indicadores(somar(lista), somaRup(lista, 'dia'), somaRup(lista, 'mes')) });\n}\nconst filtros = { marcas: selecionaveis.map(m => ({ chave: m.chave, nome: m.nome })), todas, combos };\n\nconst kpis = todas;\nreturn [{ json: { cfg, marcas, total, kpis, filtros, pbiOk: !!linhaPbiTotal, filiais, rupPorFilial, geradoEm: new Date().toISOString() } }];\n"
+      },
+      "id": "adf945ca-4ebf-47a4-b74c-cdaadea51cda",
+      "name": "Consolidar Indicadores",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        20464,
+        8640
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Renderiza o template \"DAILY LOGISTICS | ONE PAGE\" a partir do contrato de dados.\n// Os filtros de visão (Pedidos / Peças / Valor) e de marca (seleção múltipla) são 100% CSS (radio/checkbox + :checked),\n// sem JavaScript, para funcionar mesmo quando o n8n serve o HTML em sandbox.\n// Como o CSS não calcula, o fluxo pré-calcula os indicadores de cada combinação de marcas; o CSS mostra a combinação marcada.\n// O filtro de marca altera apenas os indicadores (resumo e cards); a tabela por marca não é filtrada.\nconst { cfg, marcas, total, filtros, filiais, rupPorFilial } = $input.first().json;\nconst hhmm = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' });\n\nconst esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;');\nconst isN = (v) => v === null || v === undefined || isNaN(v);\nconst num = (v) => isN(v) ? '—' : Number(v).toLocaleString('pt-BR', { maximumFractionDigits: 0 });\nconst dec = (v, c = 1) => isN(v) ? '—' : Number(v).toLocaleString('pt-BR', { minimumFractionDigits: c, maximumFractionDigits: c });\nconst mil = (v) => isN(v) ? '—' : (v >= 1000 ? dec(v / 1000, 1) + ' mil' : num(v));\nconst brl = (v) => isN(v) ? '—' : 'R$ ' + (v >= 1e6 ? dec(v / 1e6, 2) + ' mi' : num(v));\nconst sub = (p, c, r) => `${num(p)} pedidos • ${num(c)} peças • ${brl(r)}`;\nconst withUnit = (v, fmt, unit) => isN(v) ? '—' : fmt(v) + unit;\n// célula com as três visões; o CSS exibe somente a selecionada\nconst cell = (p, c, r) => `<span class=\"vp\">${num(p)}</span><span class=\"vc\">${num(c)}</span><span class=\"vr\">${brl(r)}</span>`;\nconst row = (nome, v, cls = '') => `<tr${cls}><td>${esc(nome)}</td><td class=\"n\">${cell(v.ped_i, v.pc_i, v.rs_i)}</td><td class=\"n\">${cell(v.ped_a, v.pc_a, v.rs_a)}</td><td class=\"n\">${cell(v.ped_p, v.pc_p, v.rs_p)}</td></tr>`;\n\n// ---------- Filtro de marca (seleção múltipla) ----------\nconst mk = filtros.marcas;               // marcas selecionáveis (ordem = índice do checkbox)\nconst n = mk.length;\n// valores de cada combinação: k0 = todas (sem seleção ou todas marcadas); k<mask> = combinação\nconst lista = [{ cls: 'k0', ind: filtros.todas }].concat(filtros.combos.map(c => ({ cls: 'k' + c.mask, ind: c.ind })));\nconst indis = (v) => isN(v) ? ' • indisponível' : '';\nconst SLOTS = [\n  (v) => mil(v.ped_i), (v) => sub(v.ped_i, v.pc_i, v.rs_i),\n  (v) => mil(v.ped_a), (v) => sub(v.ped_a, v.pc_a, v.rs_a),\n  (v) => mil(v.ped_p), (v) => sub(v.ped_p, v.pc_p, v.rs_p),\n  (v) => withUnit(v.slaPct, dec, '%'),\n  (v) => withUnit(v.leadTimeH, (x) => dec(x, 1), ' h'),\n  (v) => withUnit(v.leadTimeMesH, (x) => dec(x, 1), ' h'),\n  (v) => withUnit(v.rupturaDiaPct, (x) => dec(x, 2), '%'), (v) => indis(v.rupturaDiaPct),\n  (v) => withUnit(v.rupturaMesPct, (x) => dec(x, 2), '%'), (v) => indis(v.rupturaMesPct),\n  (v) => withUnit(v.backlogAcimaSlaPed, num, ' pedidos')\n];\nconst S = (i) => lista.map(c => { const t = SLOTS[i](c.ind); return t === '' ? '' : `<span class=\"k ${c.cls}\">${esc(t)}</span>`; }).join('');\n\n// regra de CSS por combinação: #b0:checked~#b1:not(:checked)~... ~ .body .k<mask>{display:inline}\nconst chain = (mask) => mk.map((_, i) => `#b${i}:${mask & (1 << i) ? 'checked' : 'not(:checked)'}`).join('~');\nlet cssMarca = '';\nif (n === 0) {\n  cssMarca = '.k0{display:inline}';\n} else {\n  const full = (1 << n) - 1;\n  cssMarca = `${chain(0)}~.body .k0,${chain(full)}~.body .k0{display:inline}\\n`;\n  filtros.combos.forEach(c => { cssMarca += `${chain(c.mask)}~.body .k${c.mask}{display:inline}\\n`; });\n  mk.forEach((_, i) => {\n    cssMarca += `#b${i}:checked ~ .body label[for=b${i}]{background:#1a1a1a;color:#fff}`\n      + `#b${i}:focus-visible ~ .body label[for=b${i}]{outline:2px solid #2563eb}\\n`;\n  });\n}\n\nconst css = `\n*{box-sizing:border-box}\nbody{font-family:Segoe UI,Arial,sans-serif;color:#1a1a1a;margin:0;background:#fff;font-size:15px}\n.page{max-width:1680px;margin:0 auto;padding:24px clamp(16px,3vw,48px);position:relative}\nh1{font-size:22px;margin:0}.meta{font-size:13px;color:#666;margin:4px 0 14px}\n.filters{display:flex;flex-wrap:wrap;gap:12px 28px;align-items:flex-end;padding:12px 16px;background:#f6f6f6;border:1px solid #e2e2e2;border-radius:6px;margin:0 0 6px}\n.fg{display:flex;flex-direction:column;gap:4px;font-size:12px;color:#555}\n.fg .row{display:flex;align-items:center;gap:6px}\n.fg input[type=date],.fg select{font:inherit;font-size:14px;padding:5px 8px;border:1px solid #bbb;border-radius:4px;background:#fff;color:#1a1a1a;min-width:150px}\n.fg select{min-width:240px}\n.btn{font:inherit;font-size:13px;padding:6px 16px;border:1px solid #1a1a1a;border-radius:4px;background:#1a1a1a;color:#fff;cursor:pointer;text-decoration:none;display:inline-block}\n.quick{display:flex;gap:6px;flex-wrap:wrap}\n.quick a{font-size:12px;padding:4px 10px;border:1px solid #bbb;border-radius:12px;color:#333;text-decoration:none;background:#fff}\n.aviso{font-size:12px;color:#8a5a00;background:#fff6e0;border:1px solid #f0d9a0;border-radius:4px;padding:6px 10px;margin:6px 0}\n.brandbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:10px 0 4px;font-size:13px;color:#555}\n.chips{display:inline-flex;gap:6px;flex-wrap:wrap}\n.chips label{padding:4px 14px;cursor:pointer;background:#fff;color:#333;border:1px solid #bbb;border-radius:14px;user-select:none}\n.clr{font:inherit;font-size:13px;padding:4px 14px;border:1px solid #bbb;border-radius:14px;background:#f3f3f3;color:#333;cursor:pointer}\n.bnote{font-size:12px;color:#777;margin:0 0 18px}\n.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:26px}\n.kpi{border:1px solid #e2e2e2;border-radius:6px;padding:14px 18px}\n.kpi .l{font-size:14px;color:#555}.kpi .v{font-size:34px;font-weight:700;margin:4px 0}.kpi .s{font-size:12px;color:#666}\nh2{font-size:16px;margin:26px 0 6px;border-bottom:1px solid #ddd;padding-bottom:5px}\n.sec1head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:26px 0 6px;border-bottom:1px solid #ddd;padding-bottom:5px}\n.sec1head h2{margin:0;padding:0;border:0}\n.seg{display:flex;align-items:center;gap:6px;font-size:13px;color:#555}\n.seg .opts{display:inline-flex;border:1px solid #bbb;border-radius:4px;overflow:hidden}\n.seg label{padding:4px 14px;cursor:pointer;background:#fff;color:#333;user-select:none}\n.seg label+label{border-left:1px solid #bbb}\n.rad{position:absolute;opacity:0;width:0;height:0;pointer-events:none}\n.vc,.vr{display:none}\n.k{display:none}\n${cssMarca}\n#v-pd:checked ~ .body label[for=v-pd],#v-pc:checked ~ .body label[for=v-pc],#v-rs:checked ~ .body label[for=v-rs]{background:#1a1a1a;color:#fff}\n#v-pc:checked ~ .body .sec1 .vp,#v-rs:checked ~ .body .sec1 .vp{display:none}\n#v-pc:checked ~ .body .sec1 .vc{display:inline}\n#v-rs:checked ~ .body .sec1 .vr{display:inline}\n#v-pd:focus-visible ~ .body label[for=v-pd],#v-pc:focus-visible ~ .body label[for=v-pc],#v-rs:focus-visible ~ .body label[for=v-rs]{outline:2px solid #2563eb}\ntable{width:100%;border-collapse:collapse;font-size:14px}\nth{text-align:left;padding:9px 8px;border-bottom:2px solid #1a1a1a}\nth.n,td.n{text-align:right}\ntd{padding:10px 8px;border-bottom:1px solid #e5e5e5}\ntr.total td{font-weight:700;border-top:2px solid #1a1a1a}\n.cards{display:grid;grid-template-columns:repeat(5,1fr);gap:14px}\n.card{border:1px solid #ccc;border-radius:6px;padding:14px 16px}\n.note{font-size:12px;color:#777;margin-top:8px}\n.card .l{font-size:14px;color:#555}.card .v{font-size:28px;font-weight:700;margin:4px 0}.card .s{font-size:12px;color:#777}\n@media (max-width:1200px){.kpis{grid-template-columns:repeat(2,1fr)}.cards{grid-template-columns:repeat(3,1fr)}}\n@media (max-width:720px){.kpis,.cards{grid-template-columns:1fr}}\n`;\n\nconst fPer = cfg.periodoD1 ? 'D-1' : 'período';\nconst qs = (o) => '?' + Object.entries(o).filter(([, v]) => v !== '' && v != null).map(([k, v]) => k + '=' + encodeURIComponent(v)).join('&');\nconst addD = (iso, d) => new Date(new Date(iso + 'T00:00:00Z').getTime() + d * 86400000).toISOString().slice(0, 10);\nconst iniMesD1 = cfg.d1.slice(0, 8) + '01';\nconst quick = [\n  ['D-1', qs({ filial: cfg.filial })],\n  ['Últimos 7 dias', qs({ ini: addD(cfg.d1, -6), fim: cfg.d1, filial: cfg.filial })],\n  ['Mês até D-1', qs({ ini: iniMesD1, fim: cfg.d1, filial: cfg.filial })]\n].map(([t, h]) => `<a href=\"${esc(h)}\">${t}</a>`).join('');\nconst opts = ['<option value=\"\">Todas as filiais</option>'].concat(filiais.map(f => `<option value=\"${esc(f)}\"${f === cfg.filial ? ' selected' : ''}>${esc(f)}</option>`)).join('');\nconst avisos = (cfg.avisos || []).map(a => `<div class=\"aviso\">${esc(a)}</div>`).join('');\nconst filtrosTopo = `<form class=\"filters\" method=\"get\" action=\"\">\n<div class=\"fg\"><span>Período (data inicial e final)</span><span class=\"row\"><input type=\"date\" name=\"ini\" value=\"${cfg.dataIni}\" max=\"${cfg.d1}\" required aria-label=\"Data inicial\"><span>até</span><input type=\"date\" name=\"fim\" value=\"${cfg.dataFim}\" max=\"${cfg.d1}\" required aria-label=\"Data final\"></span></div>\n<div class=\"fg\"><span>Filial</span><select name=\"filial\" aria-label=\"Filial\">${opts}</select></div>\n<div class=\"fg\"><span>&nbsp;</span><button class=\"btn\" type=\"submit\">Aplicar</button></div>\n<div class=\"fg\"><span>Atalhos</span><span class=\"quick\">${quick}</span></div>\n</form>${avisos}`;\n\nconst checks = mk.map((m, i) => `<input class=\"rad\" type=\"checkbox\" id=\"b${i}\" form=\"fm\" aria-label=\"Marca: ${esc(m.nome)}\">`).join('\\n');\nconst chips = mk.map((m, i) => `<label for=\"b${i}\">${esc(m.nome)}</label>`).join('');\nconst limpar = n > 0 ? '<button type=\"reset\" form=\"fm\" class=\"clr\">Limpar seleção</button>' : '';\n\nconst linhas = marcas.map(m => row(m.nome, m)).join('');\nconst linhaTotal = row('TOTAL GRUPO', total, ' class=\"total\"');\n\nconst html = `<!DOCTYPE html><html lang=\"pt-BR\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Daily Logistics | One Page</title><style>${css}</style></head><body><div class=\"page\">\n<form id=\"fm\"></form>\n<input class=\"rad\" type=\"radio\" name=\"visao\" id=\"v-pd\" checked aria-label=\"Visão por pedidos\">\n<input class=\"rad\" type=\"radio\" name=\"visao\" id=\"v-pc\" aria-label=\"Visão por peças\">\n<input class=\"rad\" type=\"radio\" name=\"visao\" id=\"v-rs\" aria-label=\"Visão por valor\">\n${checks}\n<div class=\"body\">\n<h1>DAILY LOGISTICS | ONE PAGE</h1>\n<div class=\"meta\">${esc(cfg.grupo)} • E-commerce ${esc(cfg.siteFiltro)} • ${cfg.periodoD1 ? 'Data-base: D-1 (' + esc(cfg.dataFimBR) + ')' : 'Período: ' + esc(cfg.dataIniBR) + ' a ' + esc(cfg.dataFimBR)} • ${cfg.filial ? 'Filial: ' + esc(cfg.filial) : 'Todas as filiais'} • Atualizado às ${hhmm}</div>\n${filtrosTopo}\n<div class=\"brandbar\"><span>Marcas:</span><span class=\"chips\">${chips}</span>${limpar}</div>\n<div class=\"bnote\">Selecione uma ou mais marcas; sem seleção, os indicadores mostram o total. O filtro de marca altera apenas os indicadores; a tabela mostra todas as marcas. Período e filial valem para a página inteira. Com mais de uma marca, os pedidos são somados por marca (um pedido com mais de uma marca conta em cada).</div>\n\n<div class=\"kpis\">\n  <div class=\"kpi\"><div class=\"l\">Demanda integrada</div><div class=\"v\">${S(0)}</div><div class=\"s\">${S(1)}</div></div>\n  <div class=\"kpi\"><div class=\"l\">Volume atendido</div><div class=\"v\">${S(2)}</div><div class=\"s\">${S(3)}</div></div>\n  <div class=\"kpi\"><div class=\"l\">Backlog pendente</div><div class=\"v\">${S(4)}</div><div class=\"s\">${S(5)}</div></div>\n  <div class=\"kpi\"><div class=\"l\">Cumprimento do SLA</div><div class=\"v\">${S(6)}</div><div class=\"s\">Meta: ${cfg.slaMetaPct}% • pedidos vendidos no ${fPer} expedidos em até ${cfg.leadTimeMetaH} h</div></div>\n</div>\n\n<div class=\"sec1\">\n<div class=\"sec1head\"><h2>1. DEMANDA E ATENDIMENTO POR MARCA</h2>\n  <div class=\"seg\"><span>Visão:</span><span class=\"opts\"><label for=\"v-pd\">Pedidos</label><label for=\"v-pc\">Peças</label><label for=\"v-rs\">Valor</label></span></div>\n</div>\n<table><thead><tr><th>Marca</th><th class=\"n\">Integrado</th><th class=\"n\">Atendido</th><th class=\"n\">Pendente</th></tr></thead><tbody>\n${linhas}\n${linhaTotal}\n</tbody></table>\n<div class=\"note vp\">Pedidos: contagem única (filial + pedido), exceto cancelados. O total pode ser menor que a soma das marcas, pois um pedido com mais de uma marca aparece em cada marca.</div>\n</div>\n\n<h2>2. NÍVEL DE SERVIÇO E RISCOS</h2>\n<div class=\"cards\">\n  <div class=\"card\"><div class=\"l\">Lead Time médio (${fPer})</div><div class=\"v\">${S(7)}</div><div class=\"s\">Meta: ${cfg.leadTimeMetaH} h • expedidos no ${fPer}</div></div>\n  <div class=\"card\"><div class=\"l\">Lead Time médio (mês)</div><div class=\"v\">${S(8)}</div><div class=\"s\">Meta: ${cfg.leadTimeMetaH} h • ${esc(cfg.mesLabel)} até ${esc(cfg.dataFimBR)}</div></div>\n  <div class=\"card\"><div class=\"l\">Ruptura (${fPer})</div><div class=\"v\">${S(9)}</div><div class=\"s\">Meta: ${dec(cfg.rupturaMetaPct, 2)}% • peças alteradas ÷ picking${rupPorFilial ? ' • indisponível por filial' : S(10)}</div></div>\n  <div class=\"card\"><div class=\"l\">Ruptura mensal</div><div class=\"v\">${S(11)}</div><div class=\"s\">Meta: ${dec(cfg.rupturaMetaPct, 2)}% • ${esc(cfg.mesLabel)} até ${esc(cfg.dataFimBR)}${rupPorFilial ? ' • indisponível por filial' : S(12)}</div></div>\n  <div class=\"card\"><div class=\"l\">Backlog acima do SLA</div><div class=\"v\">${S(13)}</div><div class=\"s\">Pendentes agora, vendidos nos 7 dias até ${esc(cfg.dataFimBR)}</div></div>\n</div>\n</div></div></body></html>`;\n\nreturn [{ json: { html, assunto: `Daily Logistics | ${cfg.grupo} | ${cfg.dataBaseBR}`, dataBase: cfg.dataBase, chave: cfg.chave, ehPadrao: cfg.ehPadrao } }];\n"
+      },
+      "id": "702d84bc-ec86-43be-bee1-afc388db5443",
+      "name": "Gerar HTML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        20720,
+        8640
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Guarda o HTML gerado por combinação de filtros (static data do workflow). Mantém no máximo 25 entradas (o padrão nunca é descartado).\n// Atenção: static data só persiste em execuções de produção (workflow ativo).\nconst sd = $getWorkflowStaticData('global');\nconst item = $input.first().json;\nconst cfg = $('Parâmetros').first().json;\nsd.cache = sd.cache || {};\nsd.cache[cfg.chave] = { html: item.html, geradoEm: new Date().toISOString(), dataBase: item.dataBase };\nconst padrao = `${cfg.d1}|${cfg.d1}|`;\nconst chaves = Object.keys(sd.cache).filter(k => k !== padrao).sort((a, b) => new Date(sd.cache[b].geradoEm) - new Date(sd.cache[a].geradoEm));\nchaves.slice(24).forEach(k => { delete sd.cache[k]; });\ndelete sd.html; delete sd.geradoEm; delete sd.dataBase;   // formato antigo (v8)\nreturn $input.all();\n"
+      },
+      "id": "de464c2f-0fbd-4929-853e-66c0f2c9e8d1",
+      "name": "Salvar Cache",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        20992,
+        8640
+      ],
+      "notes": "Grava o último HTML em static data para o webhook. Só persiste com o workflow ATIVO."
+    },
+    {
+      "parameters": {
+        "fromEmail": "<REMETENTE>",
+        "toEmail": "<DESTINATARIOS>",
+        "subject": "={{ $json.assunto }}",
+        "html": "={{ $json.html }}",
+        "options": {}
+      },
+      "id": "3576cc77-77b2-4341-986d-e417fe23d472",
+      "name": "Enviar E-mail",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        21248,
+        8640
+      ],
+      "webhookId": "6a17105c-bca7-498d-8b63-2728dfd6aa9a",
+      "disabled": true,
+      "notes": "Desativado. O acesso é pelo webhook; ativar somente se houver envio por e-mail (layout interativo não funciona em e-mail)."
+    },
+    {
+      "parameters": {
+        "path": "daily-logistics",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "f2ddd39d-1ac8-403f-830f-2b8ca5e25f66",
+      "name": "Webhook Relatório",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        19648,
+        8992
+      ],
+      "webhookId": "5d0a7c34-2b1e-4c6a-9f3d-7a1e5c0b2d94",
+      "notes": "URL de produção: /webhook/daily-logistics. Sem autenticação (acesso por link): restringir por rede/VPN/proxy conforme política de segurança."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Webhook: lê os filtros da URL (?ini=&fim=&filial=) e procura o relatório em cache para essa combinação.\n// Padrão (D-1, todas as filiais) = gerado de hora em hora (cache até 70 min). Outras combinações são calculadas sob demanda e ficam 15 min em cache.\nconst D1 = new Intl.DateTimeFormat('sv-SE', { timeZone: 'America/Sao_Paulo' }).format(new Date(Date.now() - 24 * 60 * 60 * 1000));\nconst q = ($('Webhook Relatório').first().json.query) || {};\nconst ok = (s) => /^\\d{4}-\\d{2}-\\d{2}$/.test(String(s || ''));\nconst ini = ok(q.ini) ? q.ini : D1, fim = ok(q.fim) ? q.fim : D1;\nconst filial = String(q.filial || '').replace(/[^0-9A-Za-zÀ-ÿ \\-_.\\/&()ºª]/g, '').trim().slice(0, 80);\nconst sd = $getWorkflowStaticData('global');\nconst cache = sd.cache || {};\n// a chave final é a calculada em \"Parâmetros\" (mesmas regras de ajuste); aqui tenta a chave bruta e a chave do padrão\nconst chaves = [`${ini}|${fim}|${filial}`];\nlet hit = null, chaveHit = null;\nfor (const k of chaves) {\n  const e = cache[k]; if (!e) continue;\n  const padrao = k === `${D1}|${D1}|`;\n  const idade = (Date.now() - new Date(e.geradoEm).getTime()) / 60000;\n  if (idade <= (padrao ? 70 : 15)) { hit = e; chaveHit = k; break; }\n}\nreturn [{ json: { cacheOk: !!hit, chave: chaveHit, idadeMin: hit ? Math.round((Date.now() - new Date(hit.geradoEm).getTime()) / 60000) : null, html: hit ? hit.html : null } }];\n"
+      },
+      "id": "a92a9faa-2ca1-4c9a-9a9a-87cd5a39c2d6",
+      "name": "Ler Cache",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        19904,
+        8992
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c0a80019-0000-4000-8000-000000000019",
+              "leftValue": "={{ $json.cacheOk }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "8c3ab648-04ab-411f-8c7b-953dc0e89305",
+      "name": "Tem Cache?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        20160,
+        8992
+      ],
+      "notes": "Sim: responde com o cache. Não: gera o relatório na hora (consulta o SQL) e responde."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c0a80020-0000-4000-8000-000000000020",
+              "leftValue": "={{ $('Webhook Relatório').isExecuted }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ee686f8f-b1fb-4192-94ab-45502813942b",
+      "name": "Veio do Webhook?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        21248,
+        8768
+      ],
+      "notes": "Responde ao usuário somente quando a execução foi iniciada pelo webhook (não pelo gatilho horário)."
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.html }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              },
+              {
+                "name": "Cache-Control",
+                "value": "no-store"
+              }
+            ]
+          }
+        }
+      },
+      "id": "e9ad4b4b-bf50-4a0a-bbe4-8d1883ab8b33",
+      "name": "Responder HTML",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        21504,
+        8896
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "3463da9f-c4e3-4ac7-9fc8-39fe49f292d7",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        19648,
+        9216
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "6515d518-2128-46ae-ad4e-c163fd847bf4",
+      "name": "Alertar Falha",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        19904,
+        9216
+      ],
+      "notes": "Stub: acionar notificação ao time de dados/TI (Teams, e-mail ou ITSM)."
+    },
+    {
+      "parameters": {
+        "content": "## Daily Logistics | One Page\n**Atualização:** a cada hora (minuto 05) -> SQL -> Power BI (ruptura) -> HTML -> cache. **Acesso:** Webhook GET /webhook/daily-logistics (sem login) serve o cache (<= 70 min); sem cache válido, gera o relatório na hora.\n**Escopo:** e-commerce HUB RIO (D-1). Todas as marcas abertas na tabela; filtro de visão (Pedidos/Peças/Valor) e filtro de marca (só indicadores) em CSS puro.\n**Definições (posição no momento da atualização):** Cancelados excluídos (bases ECOMM). Integrado = vendas D-1; Atendido = expedidos D-1; Backlog pendente = vendidos D-1 ainda sem expedição agora; Backlog D-7 (card 'acima do SLA') = vendidos D-7..D-1 ainda sem expedição agora. Lead Time = venda -> expedição (expedidos em D-1; mensal = 1º do mês até D-1). SLA = pedidos vendidos em D-1 expedidos dentro da meta ÷ (cumpridos + descumpridos; pendentes já acima da meta contam como descumpridos).\n**Ruptura (Power BI Pendência E-commerce):** peças alteradas (todos os motivos) ÷ peças em picking, HUB RIO; D-1 e mês vigente (1º do mês até D-1). Depende da atualização do dataset no Power BI.",
+        "height": 230,
+        "width": 860
+      },
+      "id": "23fe86ac-3e1c-444b-a281-ab95ac346a9f",
+      "name": "Nota - Escopo",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        20160,
+        8336
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://login.microsoftonline.com/e48bd5e1-52cd-41f5-87b9-1d25c0d108b6/oauth2/v2.0/token",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "client_id",
+              "value": "7c95980f-a178-4405-8580-3af3afbedd18"
+            },
+            {
+              "name": "client_secret",
+              "value": "<COLE_AQUI_O_NOVO_CLIENT_SECRET>"
+            },
+            {
+              "name": "grant_type",
+              "value": "client_credentials"
+            },
+            {
+              "name": "scope",
+              "value": "https://analysis.windows.net/powerbi/api/.default"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        20192,
+        8848
+      ],
+      "id": "cfb6f50e-f704-45d4-a922-fe3dc39158af",
+      "name": "pegar_token",
+      "executeOnce": true,
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "notes": "Token do Power BI (client credentials). Executa 1x. Se falhar, o relatório sai com Ruptura '—'. O client_secret deve ser guardado de forma segura (idealmente em credencial/cofre), nunca em texto no fluxo exportado."
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Gatilho Horário": {
+      "main": [
+        [
+          {
+            "node": "Parâmetros",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execução Manual": {
+      "main": [
+        [
+          {
+            "node": "Parâmetros",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parâmetros": {
+      "main": [
+        [
+          {
+            "node": "SQL - E-commerce",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SQL - E-commerce": {
+      "main": [
+        [
+          {
+            "node": "pegar_token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ruptura_Ecommerce": {
+      "main": [
+        [
+          {
+            "node": "Consolidar Indicadores",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Consolidar Indicadores": {
+      "main": [
+        [
+          {
+            "node": "Gerar HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gerar HTML": {
+      "main": [
+        [
+          {
+            "node": "Salvar Cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Salvar Cache": {
+      "main": [
+        [
+          {
+            "node": "Veio do Webhook?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Veio do Webhook?": {
+      "main": [
+        [
+          {
+            "node": "Responder HTML",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Enviar E-mail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Relatório": {
+      "main": [
+        [
+          {
+            "node": "Ler Cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ler Cache": {
+      "main": [
+        [
+          {
+            "node": "Tem Cache?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tem Cache?": {
+      "main": [
+        [
+          {
+            "node": "Responder HTML",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Parâmetros",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Alertar Falha",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "pegar_token": {
+      "main": [
+        [
+          {
+            "node": "Ruptura_Ecommerce",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false
+  },
+  "versionId": "5e8b600f-0be0-4c85-90ac-f8c345279206",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "8be17884f846555e86aa11ffd59f4aeed7d5c3fbab9e5c5d5e19e63c0a6bfb6e"
+  },
+  "id": "JHAE_CxNnIvnGPWJNZOJ7",
+  "tags": []
+}
